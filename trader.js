@@ -53,47 +53,91 @@ const ROUTER_ABI = [
 
 // ─── Pool Key Discovery (called once when token is set) ──────────────────────
 
-async function discoverPoolKey(tokenAddress) {
-  const sig = ethers.id('Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)');
-  const block = await provider.getBlockNumber();
-
-  // Sort currencies: lower address = currency0
+async function probeCommonPools(tokenAddress) {
   const [c0, c1] = tokenAddress.toLowerCase() < WETH.toLowerCase()
     ? [tokenAddress, WETH]
     : [WETH, tokenAddress];
 
-  // Search in chunks of 9000 blocks, last 300k blocks max
-  for (let from = block; from >= block - 300000; from -= 9000) {
-    const fromBlock = Math.max(from - 8999, 0);
-    const toBlock   = from;
+  const pm = new ethers.Contract(POOL_MANAGER, [
+    'function getSlot0(bytes32) external view returns (uint160, int24, uint24, uint24)',
+  ], provider);
+  const coder = ethers.AbiCoder.defaultAbiCoder();
+  const hooks = ethers.ZeroAddress;
+
+  const CONFIGS = [
+    { fee: 500, tickSpacing: 10 },
+    { fee: 3000, tickSpacing: 60 },
+    { fee: 10000, tickSpacing: 200 },
+    { fee: 100, tickSpacing: 1 },
+  ];
+
+  for (const { fee, tickSpacing } of CONFIGS) {
+    const poolId = ethers.keccak256(
+      coder.encode(
+        ['address', 'address', 'uint24', 'int24', 'address'],
+        [c0, c1, fee, tickSpacing, hooks]
+      )
+    );
+    try {
+      const [sqrtPriceX96] = await pm.getSlot0(poolId);
+      if (sqrtPriceX96 > 0n) {
+        return { currency0: c0, currency1: c1, fee, tickSpacing, hooks };
+      }
+    } catch {
+      break; // getSlot0 not available on this deployment, skip probing
+    }
+  }
+  return null;
+}
+
+async function discoverPoolKey(tokenAddress) {
+  // Fast path: probe common pool configurations via PoolManager.getSlot0
+  try {
+    const probed = await probeCommonPools(tokenAddress);
+    if (probed) return probed;
+  } catch {}
+
+  // Slow path: scan Initialize events with precise topic filters
+  const sig = ethers.id('Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)');
+  const block = await provider.getBlockNumber();
+
+  const [c0, c1] = tokenAddress.toLowerCase() < WETH.toLowerCase()
+    ? [tokenAddress, WETH]
+    : [WETH, tokenAddress];
+
+  // Filter by indexed currency0 + currency1 for efficiency
+  const topic2 = ethers.zeroPadValue(c0, 32);
+  const topic3 = ethers.zeroPadValue(c1, 32);
+
+  const iface = new ethers.Interface([
+    'event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)',
+  ]);
+
+  // Search 5M blocks (~115 days on Base) in 10k-block chunks
+  for (let from = block; from >= block - 5000000; from -= 10000) {
+    const fromBlock = Math.max(from - 9999, 0);
     try {
       const logs = await provider.getLogs({
         address:   POOL_MANAGER,
-        topics:    [sig],
+        topics:    [sig, null, topic2, topic3],
         fromBlock,
-        toBlock,
+        toBlock:   from,
       });
-      const iface = new ethers.Interface([
-        'event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)',
-      ]);
       for (const log of logs) {
         try {
           const e = iface.parseLog(log);
-          if (
-            e.args.currency0.toLowerCase() === c0.toLowerCase() &&
-            e.args.currency1.toLowerCase() === c1.toLowerCase()
-          ) {
-            return {
-              currency0:   e.args.currency0,
-              currency1:   e.args.currency1,
-              fee:         Number(e.args.fee),
-              tickSpacing: Number(e.args.tickSpacing),
-              hooks:       e.args.hooks,
-            };
-          }
+          return {
+            currency0:   e.args.currency0,
+            currency1:   e.args.currency1,
+            fee:         Number(e.args.fee),
+            tickSpacing: Number(e.args.tickSpacing),
+            hooks:       e.args.hooks,
+          };
         } catch {}
       }
-    } catch {}
+    } catch {
+      await new Promise(r => setTimeout(r, 200));
+    }
   }
   return null;
 }
@@ -210,7 +254,7 @@ async function sellToken(privateKey, tokenAddress, percentage, _feeTier, decimal
       data:     token.interface.encodeFunctionData('approve', [PERMIT2, ethers.MaxUint256]),
       gasLimit: 100000n,
     });
-    console.log('ERC20 → Permit2 approved');
+    // ERC20 → Permit2 approved
   }
 
   // Ensure Permit2 → Universal Router approval (uint160 max, not uint256!)
@@ -227,7 +271,7 @@ async function sellToken(privateKey, tokenAddress, percentage, _feeTier, decimal
       data:     permit2.interface.encodeFunctionData('approve', [tokenAddress, UNIVERSAL_ROUTER, MAX_UINT160, expiry]),
       gasLimit: 100000n,
     });
-    console.log('Permit2 → Router approved');
+    // Permit2 → Router approved
   }
 
   // PERMIT2_TRANSFER_FROM (0x02) + V4_SWAP (0x10) + UNWRAP_WETH (0x0c)
@@ -274,10 +318,9 @@ async function unwrapWETH(wallet) {
         data:     weth.interface.encodeFunctionData('withdraw', [bal]),
         gasLimit: 60000n,
       });
-      console.log(`Unwrapped ${ethers.formatEther(bal)} WETH → ETH`);
     }
-  } catch (e) {
-    console.error('WETH unwrap error:', e.message);
+  } catch {
+    // WETH unwrap failed silently — non-critical
   }
 }
 

@@ -26,6 +26,7 @@ const defaultUser = () => ({
   min_interval_sec:  20,
   max_interval_sec:  60,
   trade_count:       0,
+  trade_history:     [],
   created_at:        Math.floor(Date.now() / 1000),
 });
 

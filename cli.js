@@ -13,12 +13,43 @@ const path    = require('path');
 const USER_ID = 7332734457;
 const WETH    = '0x4200000000000000000000000000000000000006';
 
+// ─── Pool Key Builder (mirrors index.js poolKeyFromUser) ─────────────────────
+function poolKeyFromUser(user) {
+  if (user.fee_tier == null || user.tick_spacing == null || user.hook_address == null || !user.token_address) return null;
+  const tokenLower = user.token_address.toLowerCase();
+  const wethLower  = WETH.toLowerCase();
+  return {
+    currency0:   tokenLower < wethLower ? user.token_address : WETH,
+    currency1:   tokenLower < wethLower ? WETH : user.token_address,
+    fee:         user.fee_tier,
+    tickSpacing: user.tick_spacing,
+    hooks:       user.hook_address,
+  };
+}
+
+// ─── Color Palette ──────────────────────────────────────────────────────────
+const C = {
+  bg:       '#0d1117',
+  bgAlt:    '#161b22',
+  border:   '#30363d',
+  focus:    '#58a6ff',
+  accent:   '#238636',
+  text:     '#c9d1d9',
+  dim:      '#8b949e',
+  success:  '#3fb950',
+  error:    '#f85149',
+  warn:     '#d29922',
+  info:     '#58a6ff',
+  purple:   '#bc8cff',
+};
+
 // ─── State ───────────────────────────────────────────────────────────────────
-let running       = false;
-let tradeTimer    = null;
-let nextTradeIn   = 0;
-let countdownTimer = null;
-let pendingMsg    = '';
+let running             = false;
+let tradeTimer          = null;
+let nextTradeIn         = 0;
+let totalCountdownSecs  = 0;
+let countdownTimer      = null;
+let pendingMsg          = '';
 
 // ─── Auto-create + auto-import ───────────────────────────────────────────────
 if (!getUser(USER_ID)) createUser(USER_ID);
@@ -35,85 +66,85 @@ if (!getUser(USER_ID)) createUser(USER_ID);
 // ─── Screen ──────────────────────────────────────────────────────────────────
 const screen = blessed.screen({
   smartCSR: true, title: 'Volume Bot',
-  fullUnicode: false, forceUnicode: false,
+  fullUnicode: true, forceUnicode: true,
   ignoreLocked: ['C-c'],
 });
 
 // ─── TOP BAR ─────────────────────────────────────────────────────────────────
 const topBar = blessed.box({
-  top: 0, left: 0, width: '100%', height: 3,
+  top: 0, left: 0, width: '100%', height: 5,
   tags: true,
-  style: { bg: '#0d1117', fg: 'white' },
   border: { type: 'line' },
-  style: { bg: '#0d1117', border: { fg: '#30363d' } },
+  style: { bg: C.bg, border: { fg: C.border } },
   padding: { left: 1 },
 });
 
 // ─── LEFT: Menu ──────────────────────────────────────────────────────────────
 const menuBox = blessed.list({
-  top: 3, left: 0, width: '28%', height: '55%',
+  top: 5, left: 0, width: '25%', height: '55%-5',
   label: ' {bold}{cyan-fg} ACTIONS {/cyan-fg}{/bold} ',
   tags: true,
   border: { type: 'line' },
   style: {
-    bg: '#0d1117', border: { fg: '#30363d' },
-    selected: { bg: '#238636', fg: 'white', bold: true },
-    item: { fg: '#c9d1d9' },
+    bg: C.bg, border: { fg: C.focus },
+    selected: { bg: C.accent, fg: 'white', bold: true },
+    item: { fg: C.text },
     label: { fg: 'cyan' },
   },
   keys: true, vi: false, mouse: true,
   padding: { left: 1, top: 1 },
   items: [
-    ' START BOT',
-    ' STOP BOT',
-    ' BUY  (random)',
-    ' SELL 100%',
-    ' SETTINGS',
-    ' QUIT',
+    ' \u25B6  START BOT',
+    ' \u25A0  STOP BOT',
+    ' \u2B06  BUY TOKEN',
+    ' \u2B07  SELL TOKEN',
+    ' \u2699  SETTINGS',
+    ' \u2716  QUIT',
   ],
 });
 
 // ─── RIGHT TOP: Balances ──────────────────────────────────────────────────────
 const balBox = blessed.box({
-  top: 3, right: 0, width: '72%', height: '28%',
+  top: 5, right: 0, width: '75%', height: '25%',
   label: ' {bold}{yellow-fg} BALANCES {/yellow-fg}{/bold} ',
   tags: true,
   border: { type: 'line' },
-  style: { bg: '#0d1117', border: { fg: '#30363d' } },
+  style: { bg: C.bg, border: { fg: C.border } },
   padding: { left: 2, top: 1 },
   content: '{gray-fg}Loading...{/gray-fg}',
 });
 
 // ─── RIGHT BOTTOM: Config Info ────────────────────────────────────────────────
 const infoBox = blessed.box({
-  top: '28%+3', right: 0, width: '72%',
-  bottom: '45%',
-  label: ' {bold}{magenta-fg} CONFIG {/magenta-fg}{/bold} ',
+  top: '25%+5', right: 0, width: '75%',
+  bottom: '40%+3',
+  label: ' {bold}{magenta-fg} CONFIG & PnL {/magenta-fg}{/bold} ',
   tags: true,
   border: { type: 'line' },
-  style: { bg: '#0d1117', border: { fg: '#30363d' } },
+  style: { bg: C.bg, border: { fg: C.border } },
   padding: { left: 2, top: 0 },
   content: '',
 });
 
 // ─── TRADE LOG ───────────────────────────────────────────────────────────────
 const logBox = blessed.log({
-  bottom: 2, left: 0, width: '100%', height: '45%',
+  bottom: 3, left: 0, width: '100%', height: '40%',
   label: ' {bold}{green-fg} TRADE LOG {/green-fg}{/bold} ',
   tags: true,
   border: { type: 'line' },
-  style: { bg: '#0d1117', border: { fg: '#30363d' }, scrollbar: { bg: '#238636' } },
+  style: { bg: C.bg, border: { fg: C.border }, scrollbar: { bg: C.accent } },
   padding: { left: 1 },
   scrollable: true, alwaysScroll: true, mouse: true,
-  scrollbar: { ch: ' ', track: { bg: '#161b22' } },
+  scrollbar: { ch: ' ', track: { bg: C.bgAlt } },
 });
 
 // ─── BOTTOM BAR ──────────────────────────────────────────────────────────────
 const botBar = blessed.box({
-  bottom: 0, left: 0, width: '100%', height: 2,
+  bottom: 0, left: 0, width: '100%', height: 3,
   tags: true,
-  style: { bg: '#161b22', fg: '#8b949e' },
-  content: '{center}{gray-fg} Up/Down: navigate    Enter: select    R: refresh balances    Q: quit {/gray-fg}{/center}',
+  border: { type: 'line' },
+  style: { bg: C.bgAlt, fg: C.dim, border: { fg: C.border } },
+  content: '{center}{gray-fg} \u2191/\u2193 Navigate    Enter Select    R Refresh    Q Quit {/gray-fg}{/center}',
 });
 
 screen.append(topBar);
@@ -124,23 +155,47 @@ screen.append(logBox);
 screen.append(botBar);
 menuBox.focus();
 
+// ─── PROGRESS BAR ───────────────────────────────────────────────────────────
+function makeProgressBar(current, total, width) {
+  width = width || 15;
+  if (total <= 0) return '';
+  const filled = Math.round((1 - current / total) * width);
+  const empty = width - filled;
+  return '{green-fg}' + '\u2588'.repeat(filled) + '{/green-fg}' +
+         '{gray-fg}' + '\u2591'.repeat(empty) + '{/gray-fg}';
+}
+
 // ─── TOP BAR UPDATE ──────────────────────────────────────────────────────────
 function updateTopBar() {
   const user   = getUser(USER_ID) || {};
   const status = running
-    ? '{green-fg}{bold} RUNNING {/bold}{/green-fg}'
-    : '{red-fg}{bold} STOPPED {/red-fg}{/bold}';
-  const next   = running && nextTradeIn > 0
-    ? `{yellow-fg}Next: ${nextTradeIn}s{/yellow-fg}  `
+    ? '{green-fg}{bold}\u25CF RUNNING{/bold}{/green-fg}'
+    : '{red-fg}{bold}\u25CF STOPPED{/bold}{/red-fg}';
+  const next = running && nextTradeIn > 0
+    ? `  ${makeProgressBar(nextTradeIn, totalCountdownSecs, 12)} {yellow-fg}${nextTradeIn}s{/yellow-fg}`
     : '';
   const trades = `{cyan-fg}Trades: ${user.trade_count || 0}{/cyan-fg}`;
   const now    = new Date().toLocaleTimeString('en-US', { hour12: false });
-  const pend   = pendingMsg ? `  {yellow-fg}${pendingMsg}{/yellow-fg}` : '';
+  const pend   = pendingMsg ? `  {yellow-fg}\u23F3 ${pendingMsg}{/yellow-fg}` : '';
 
-  topBar.setContent(
-    `  {bold}{white-fg}VOLUME BOT{/white-fg}{/bold}   ${status}   ${next}${trades}${pend}   {gray-fg}${now}{/gray-fg}`
-  );
+  const logo = `{bold}{#58a6ff-fg}\u25C8 VOLUME BOT{/#58a6ff-fg}{/bold}  {gray-fg}\u2502{/gray-fg}  {white-fg}Uniswap V4 on Base{/white-fg}`;
+  const statusLine = `  ${status}   ${next}   ${trades}${pend}   {gray-fg}${now}{/gray-fg}`;
+
+  topBar.setContent(`${logo}\n\n${statusLine}`);
   screen.render();
+}
+
+// ─── PnL CALCULATION ─────────────────────────────────────────────────────────
+function calculatePnL() {
+  const user = getUser(USER_ID) || {};
+  const history = user.trade_history || [];
+  let totalBuyUsd = 0, totalSellUsd = 0, totalGasEth = 0;
+  for (const t of history) {
+    if (t.type === 'buy') totalBuyUsd += t.amountUsd || 0;
+    else totalSellUsd += t.amountUsd || 0;
+    totalGasEth += parseFloat(t.gasUsed || '0');
+  }
+  return { totalBuyUsd, totalSellUsd, totalGasEth, net: totalSellUsd - totalBuyUsd };
 }
 
 // ─── INFO BOX UPDATE ─────────────────────────────────────────────────────────
@@ -148,12 +203,15 @@ function updateInfo() {
   const user = getUser(USER_ID) || {};
   const wallet = user.wallet_address
     ? `{cyan-fg}${user.wallet_address.slice(0,10)}...${user.wallet_address.slice(-6)}{/cyan-fg}`
-    : '{red-fg}NOT SET - go to SETTINGS{/red-fg}';
+    : '{red-fg}NOT SET \u2014 go to SETTINGS{/red-fg}';
+  const pnl = calculatePnL();
+  const pnlColor = pnl.net >= 0 ? 'green-fg' : 'red-fg';
   infoBox.setContent(
     ` Wallet   : ${wallet}\n` +
-    ` Token    : {cyan-fg}${user.token_symbol || 'MIME'}{/cyan-fg}  {gray-fg}${(user.token_address||'').slice(0,12)}...{/gray-fg}\n` +
-    ` Amount   : {yellow-fg}$${user.min_amount_usd||0.10} - $${user.max_amount_usd||0.50}{/yellow-fg}\n` +
-    ` Interval : {yellow-fg}${user.min_interval_sec||20}s - ${user.max_interval_sec||60}s{/yellow-fg}`
+    ` Token    : {cyan-fg}${user.token_symbol || 'TOKEN'}{/cyan-fg}  {gray-fg}${(user.token_address||'').slice(0,12)}...{/gray-fg}\n` +
+    ` Amount   : {yellow-fg}$${user.min_amount_usd||0.10} \u2013 $${user.max_amount_usd||0.50}{/yellow-fg}\n` +
+    ` Interval : {yellow-fg}${user.min_interval_sec||20}s \u2013 ${user.max_interval_sec||60}s{/yellow-fg}\n` +
+    ` PnL      : {${pnlColor}}$${pnl.net.toFixed(2)}{/${pnlColor}}  {gray-fg}(Buy: $${pnl.totalBuyUsd.toFixed(2)} | Sell: $${pnl.totalSellUsd.toFixed(2)} | Gas: ${pnl.totalGasEth.toFixed(4)} ETH){/gray-fg}`
   );
   screen.render();
 }
@@ -162,7 +220,7 @@ function updateInfo() {
 async function refreshBalances() {
   const user = getUser(USER_ID) || {};
   if (!user.wallet_address) {
-    balBox.setContent('{red-fg}  No wallet — go to SETTINGS to import{/red-fg}');
+    balBox.setContent('{red-fg}  No wallet \u2014 go to SETTINGS to import{/red-fg}');
     screen.render();
     return;
   }
@@ -194,9 +252,34 @@ function addLog(msg) {
   screen.render();
 }
 
+// ─── GAS DISPLAY HELPER ─────────────────────────────────────────────────────
+function formatGas(receipt) {
+  try {
+    const gasUsed = receipt.gasUsed || 0n;
+    const gasPrice = receipt.gasPrice || receipt.effectiveGasPrice || 0n;
+    return parseFloat(ethers.formatEther(gasUsed * gasPrice)).toFixed(6);
+  } catch { return '?'; }
+}
+
+// ─── TRADE HISTORY HELPER ───────────────────────────────────────────────────
+function recordTrade(type, amountUsd, amountEth, receipt) {
+  const user = getUser(USER_ID) || {};
+  const history = (user.trade_history || []).slice(-99); // keep max 100
+  history.push({
+    type,
+    amountUsd: amountUsd || 0,
+    amountEth: amountEth || 0,
+    txHash: receipt.hash,
+    gasUsed: formatGas(receipt),
+    timestamp: Date.now(),
+  });
+  updateUser(USER_ID, { trade_count: (user.trade_count || 0) + 1, trade_history: history });
+}
+
 // ─── COUNTDOWN ───────────────────────────────────────────────────────────────
 function startCountdown(seconds) {
   nextTradeIn = seconds;
+  totalCountdownSecs = seconds;
   if (countdownTimer) clearInterval(countdownTimer);
   countdownTimer = setInterval(() => {
     nextTradeIn = Math.max(0, nextTradeIn - 1);
@@ -208,8 +291,9 @@ function startCountdown(seconds) {
 // ─── TRADING ─────────────────────────────────────────────────────────────────
 async function runTrade() {
   if (!running) return;
-  const user     = getUser(USER_ID);
-  const poolKey  = { currency0: user.token_address, currency1: WETH, fee: user.fee_tier, tickSpacing: user.tick_spacing, hooks: user.hook_address };
+  const user    = getUser(USER_ID);
+  const poolKey = poolKeyFromUser(user);
+  if (!poolKey) { addLog('{red-fg}\u2717 Pool key not configured \u2014 go to SETTINGS \u2192 Set Token Address{/red-fg}'); stopBot(); return; }
   const ethPrice = await getEthPrice().catch(() => 2000);
   const usdAmt   = randomBetween(user.min_amount_usd, user.max_amount_usd);
   const ethAmt   = usdAmt / ethPrice;
@@ -219,20 +303,23 @@ async function runTrade() {
   try {
     if (isBuy) {
       pendingMsg = 'Buying...'; updateTopBar();
-      addLog(`{yellow-fg}BUY{/yellow-fg}   $${usdAmt.toFixed(2)}  (${ethAmt.toFixed(6)} ETH)`);
+      addLog(`{yellow-fg}\u25B2 BUY{/yellow-fg}   $${usdAmt.toFixed(2)}  (${ethAmt.toFixed(6)} ETH)`);
       const r = await trader.buyToken(pk, user.token_address, ethAmt, null, poolKey);
-      updateUser(USER_ID, { trade_count: user.trade_count + 1 });
-      addLog(`{green-fg}OK{/green-fg}    BUY #${user.trade_count + 1}  {gray-fg}${r.hash.slice(0,22)}...{/gray-fg}`);
+      const gas = formatGas(r);
+      recordTrade('buy', usdAmt, ethAmt, r);
+      addLog(`{green-fg}\u2713 BUY OK{/green-fg}  #${user.trade_count + 1}  {gray-fg}Gas: ${gas} ETH  TX: ${r.hash.slice(0,18)}...{/gray-fg}`);
     } else {
       const pct = Math.floor(randomBetween(5, 15));
       pendingMsg = 'Selling...'; updateTopBar();
-      addLog(`{magenta-fg}SELL{/magenta-fg}  ${pct}% of ${user.token_symbol || 'TOKEN'}`);
+      addLog(`{magenta-fg}\u25BC SELL{/magenta-fg}  ${pct}% of ${user.token_symbol || 'TOKEN'}`);
       const r = await trader.sellToken(pk, user.token_address, pct, null, 18, poolKey);
-      updateUser(USER_ID, { trade_count: user.trade_count + 1 });
-      addLog(`{green-fg}OK{/green-fg}    SELL #${user.trade_count + 1}  {gray-fg}${r.hash.slice(0,22)}...{/gray-fg}`);
+      const gas = formatGas(r);
+      recordTrade('sell', 0, 0, r);
+      addLog(`{green-fg}\u2713 SELL OK{/green-fg} #${user.trade_count + 1}  {gray-fg}Gas: ${gas} ETH  TX: ${r.hash.slice(0,18)}...{/gray-fg}`);
     }
   } catch (e) {
-    addLog(`{red-fg}ERR{/red-fg}   ${e.message.slice(0, 70)}`);
+    const msg = (e.shortMessage || e.reason || e.message || '').slice(0, 60);
+    addLog(`{red-fg}\u2717 ERR{/red-fg}   ${msg}`);
   }
 
   pendingMsg = ''; updateTopBar();
@@ -241,7 +328,7 @@ async function runTrade() {
 
   if (running) {
     const delay = Math.floor(randomBetween(user.min_interval_sec, user.max_interval_sec));
-    addLog(`{gray-fg}WAIT  ${delay}s...{/gray-fg}`);
+    addLog(`{gray-fg}\u23F1 WAIT  ${delay}s...{/gray-fg}`);
     startCountdown(delay);
     tradeTimer = setTimeout(runTrade, delay * 1000);
   }
@@ -249,10 +336,11 @@ async function runTrade() {
 
 function startBot() {
   const user = getUser(USER_ID);
-  if (!user?.wallet_encrypted) { addLog('{red-fg}ERR   No wallet — go to SETTINGS{/red-fg}'); return; }
+  if (!user?.wallet_encrypted) { addLog('{red-fg}\u2717 No wallet \u2014 go to SETTINGS{/red-fg}'); return; }
+  if (!poolKeyFromUser(user)) { addLog('{red-fg}\u2717 Pool key not set \u2014 go to SETTINGS \u2192 Set Token Address{/red-fg}'); return; }
   if (running) { addLog('{gray-fg}Already running{/gray-fg}'); return; }
   running = true;
-  addLog('{green-fg}{bold}--- BOT STARTED ---{/bold}{/green-fg}');
+  addLog('{green-fg}{bold}\u2500\u2500\u2500 BOT STARTED \u2500\u2500\u2500{/bold}{/green-fg}');
   updateTopBar(); updateInfo();
   runTrade();
 }
@@ -264,24 +352,26 @@ function stopBot() {
   if (tradeTimer) { clearTimeout(tradeTimer); tradeTimer = null; }
   if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
   nextTradeIn = 0;
-  addLog('{red-fg}{bold}--- BOT STOPPED ---{/bold}{/red-fg}');
+  addLog('{red-fg}{bold}\u2500\u2500\u2500 BOT STOPPED \u2500\u2500\u2500{/bold}{/red-fg}');
   updateTopBar(); updateInfo();
 }
 
 async function doBuy(usdAmt) {
   const user = getUser(USER_ID);
-  if (!user?.wallet_encrypted) { addLog('{red-fg}ERR   No wallet — go to SETTINGS{/red-fg}'); return; }
-  const poolKey  = { currency0: user.token_address, currency1: WETH, fee: user.fee_tier, tickSpacing: user.tick_spacing, hooks: user.hook_address };
+  if (!user?.wallet_encrypted) { addLog('{red-fg}\u2717 No wallet \u2014 go to SETTINGS{/red-fg}'); return; }
+  const poolKey = poolKeyFromUser(user);
+  if (!poolKey) { addLog('{red-fg}\u2717 Pool key not set \u2014 go to SETTINGS \u2192 Set Token Address{/red-fg}'); return; }
   const ethPrice = await getEthPrice().catch(() => 2000);
   const ethAmt   = usdAmt / ethPrice;
   pendingMsg = 'Buying...'; updateTopBar();
-  addLog(`{yellow-fg}BUY{/yellow-fg}   $${usdAmt.toFixed(2)} (manual)`);
+  addLog(`{yellow-fg}\u25B2 BUY{/yellow-fg}   $${usdAmt.toFixed(2)} (manual)`);
   try {
     const r = await trader.buyToken(decrypt(user.wallet_encrypted), user.token_address, ethAmt, null, poolKey);
-    updateUser(USER_ID, { trade_count: user.trade_count + 1 });
-    addLog(`{green-fg}OK{/green-fg}    BUY  {gray-fg}${r.hash.slice(0,22)}...{/gray-fg}`);
+    const gas = formatGas(r);
+    recordTrade('buy', usdAmt, ethAmt, r);
+    addLog(`{green-fg}\u2713 BUY OK{/green-fg}  {gray-fg}Gas: ${gas} ETH  TX: ${r.hash.slice(0,18)}...{/gray-fg}`);
     await refreshBalances();
-  } catch (e) { addLog(`{red-fg}ERR{/red-fg}   ${e.message.slice(0,70)}`); }
+  } catch (e) { addLog(`{red-fg}\u2717 ERR{/red-fg}   ${(e.shortMessage || e.reason || e.message || '').slice(0, 60)}`); }
   pendingMsg = ''; updateTopBar(); updateInfo();
 }
 
@@ -289,27 +379,182 @@ async function doSell(pct) {
   const wasRunning = running;
   if (running) stopBot();
   const user = getUser(USER_ID);
-  if (!user?.wallet_encrypted) { addLog('{red-fg}ERR   No wallet — go to SETTINGS{/red-fg}'); return; }
-  const poolKey = { currency0: user.token_address, currency1: WETH, fee: user.fee_tier, tickSpacing: user.tick_spacing, hooks: user.hook_address };
+  if (!user?.wallet_encrypted) { addLog('{red-fg}\u2717 No wallet \u2014 go to SETTINGS{/red-fg}'); return; }
+  const poolKey = poolKeyFromUser(user);
+  if (!poolKey) { addLog('{red-fg}\u2717 Pool key not set \u2014 go to SETTINGS \u2192 Set Token Address{/red-fg}'); if (wasRunning) startBot(); return; }
   pendingMsg = 'Selling...'; updateTopBar();
-  addLog(`{magenta-fg}SELL{/magenta-fg}  ${pct}% (manual)`);
+  addLog(`{magenta-fg}\u25BC SELL{/magenta-fg}  ${pct}% (manual)`);
   try {
     const r = await trader.sellToken(decrypt(user.wallet_encrypted), user.token_address, pct, null, 18, poolKey);
-    updateUser(USER_ID, { trade_count: user.trade_count + 1 });
-    addLog(`{green-fg}OK{/green-fg}    SELL {gray-fg}${r.hash.slice(0,22)}...{/gray-fg}`);
+    const gas = formatGas(r);
+    recordTrade('sell', 0, 0, r);
+    addLog(`{green-fg}\u2713 SELL OK{/green-fg} {gray-fg}Gas: ${gas} ETH  TX: ${r.hash.slice(0,18)}...{/gray-fg}`);
     await refreshBalances();
-  } catch (e) { addLog(`{red-fg}ERR{/red-fg}   ${e.message.slice(0,70)}`); }
+  } catch (e) { addLog(`{red-fg}\u2717 ERR{/red-fg}   ${(e.shortMessage || e.reason || e.message || '').slice(0, 60)}`); }
   pendingMsg = ''; updateTopBar(); updateInfo();
   if (wasRunning) startBot();
+}
+
+// ─── BUY MENU ───────────────────────────────────────────────────────────────
+function openBuyMenu() {
+  const user = getUser(USER_ID) || {};
+  const minA = user.min_amount_usd || 0.10;
+  const maxA = user.max_amount_usd || 0.50;
+
+  const overlay = blessed.box({
+    top: 'center', left: 'center', width: 42, height: 14,
+    tags: true, border: { type: 'line' },
+    label: ' {bold}{yellow-fg} \u25B2 BUY TOKEN {/yellow-fg}{/bold} ',
+    style: { bg: C.bgAlt, border: { fg: C.focus } },
+  });
+
+  const buyList = blessed.list({
+    parent: overlay,
+    top: 1, left: 1, right: 1, bottom: 3,
+    tags: true,
+    style: {
+      bg: C.bgAlt, fg: C.text,
+      selected: { bg: C.accent, fg: 'white', bold: true },
+    },
+    keys: true, mouse: true,
+    items: [
+      `  \u{1F3B2}  Random ($${minA.toFixed(2)} \u2013 $${maxA.toFixed(2)})`,
+      '  \u270E  Custom Amount (USD)',
+      '  \u25CF  $1.00',
+      '  \u25CF  $5.00',
+      '  \u25CF  $10.00',
+      '  \u2190  Back',
+    ],
+  });
+
+  const hint = blessed.text({
+    parent: overlay,
+    bottom: 1, left: 2, right: 2,
+    tags: true, height: 1,
+    content: '{gray-fg}Enter: select   Esc: back{/gray-fg}',
+    style: { bg: C.bgAlt },
+  });
+
+  screen.append(overlay);
+  buyList.focus();
+  screen.render();
+
+  buyList.on('select', (item, idx) => {
+    if (idx === 5) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
+    if (idx === 0) {
+      overlay.destroy(); menuBox.focus(); screen.render();
+      doBuy(randomBetween(minA, maxA));
+      return;
+    }
+    if (idx >= 2 && idx <= 4) {
+      const amounts = [1, 5, 10];
+      overlay.destroy(); menuBox.focus(); screen.render();
+      doBuy(amounts[idx - 2]);
+      return;
+    }
+    // idx === 1: custom amount
+    const inputBox = blessed.textbox({
+      top: 'center', left: 'center', width: 44, height: 5,
+      label: '  Amount in USD (e.g. 2.50):  ',
+      tags: true, border: { type: 'line' },
+      style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
+      inputOnFocus: true,
+    });
+    screen.append(inputBox);
+    inputBox.focus();
+    screen.render();
+    inputBox.on('submit', (val) => {
+      inputBox.destroy();
+      const amt = parseFloat(val.trim());
+      if (isNaN(amt) || amt <= 0) { addLog('{red-fg}\u2717 Invalid amount{/red-fg}'); overlay.destroy(); menuBox.focus(); screen.render(); return; }
+      overlay.destroy(); menuBox.focus(); screen.render();
+      doBuy(amt);
+    });
+    inputBox.key(['escape'], () => { inputBox.destroy(); buyList.focus(); screen.render(); });
+  });
+
+  buyList.key(['escape', 'q'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
+}
+
+// ─── SELL MENU ──────────────────────────────────────────────────────────────
+function openSellMenu() {
+  const overlay = blessed.box({
+    top: 'center', left: 'center', width: 42, height: 14,
+    tags: true, border: { type: 'line' },
+    label: ' {bold}{magenta-fg} \u25BC SELL TOKEN {/magenta-fg}{/bold} ',
+    style: { bg: C.bgAlt, border: { fg: C.focus } },
+  });
+
+  const sellList = blessed.list({
+    parent: overlay,
+    top: 1, left: 1, right: 1, bottom: 3,
+    tags: true,
+    style: {
+      bg: C.bgAlt, fg: C.text,
+      selected: { bg: C.accent, fg: 'white', bold: true },
+    },
+    keys: true, mouse: true,
+    items: [
+      '  \u25CF  Sell 25%',
+      '  \u25CF  Sell 50%',
+      '  \u25CF  Sell 75%',
+      '  \u25CF  Sell 100%',
+      '  \u270E  Custom %',
+      '  \u2190  Back',
+    ],
+  });
+
+  const hint = blessed.text({
+    parent: overlay,
+    bottom: 1, left: 2, right: 2,
+    tags: true, height: 1,
+    content: '{gray-fg}Enter: select   Esc: back{/gray-fg}',
+    style: { bg: C.bgAlt },
+  });
+
+  screen.append(overlay);
+  sellList.focus();
+  screen.render();
+
+  sellList.on('select', (item, idx) => {
+    if (idx === 5) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
+    if (idx >= 0 && idx <= 3) {
+      const pcts = [25, 50, 75, 100];
+      overlay.destroy(); menuBox.focus(); screen.render();
+      doSell(pcts[idx]);
+      return;
+    }
+    // idx === 4: custom %
+    const inputBox = blessed.textbox({
+      top: 'center', left: 'center', width: 44, height: 5,
+      label: '  Sell percentage (1-100):  ',
+      tags: true, border: { type: 'line' },
+      style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
+      inputOnFocus: true,
+    });
+    screen.append(inputBox);
+    inputBox.focus();
+    screen.render();
+    inputBox.on('submit', (val) => {
+      inputBox.destroy();
+      const pct = parseInt(val.trim());
+      if (isNaN(pct) || pct < 1 || pct > 100) { addLog('{red-fg}\u2717 Invalid percentage (1-100){/red-fg}'); overlay.destroy(); menuBox.focus(); screen.render(); return; }
+      overlay.destroy(); menuBox.focus(); screen.render();
+      doSell(pct);
+    });
+    inputBox.key(['escape'], () => { inputBox.destroy(); sellList.focus(); screen.render(); });
+  });
+
+  sellList.key(['escape', 'q'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
 }
 
 // ─── SETTINGS ────────────────────────────────────────────────────────────────
 function openSettings() {
   const overlay = blessed.box({
-    top: 'center', left: 'center', width: 52, height: 12,
+    top: 'center', left: 'center', width: 54, height: 16,
     tags: true, border: { type: 'line' },
-    label: ' {bold}{magenta-fg} SETTINGS {/magenta-fg}{/bold} ',
-    style: { bg: '#161b22', border: { fg: '#58a6ff' } },
+    label: ' {bold}{magenta-fg} \u2699 SETTINGS {/magenta-fg}{/bold} ',
+    style: { bg: C.bgAlt, border: { fg: C.focus } },
   });
 
   const settingsList = blessed.list({
@@ -317,86 +562,170 @@ function openSettings() {
     top: 1, left: 1, right: 1, bottom: 3,
     tags: true,
     style: {
-      bg: '#161b22', fg: '#c9d1d9',
+      bg: C.bgAlt, fg: C.text,
       selected: { bg: '#1f6feb', fg: 'white', bold: true },
     },
     keys: true, mouse: true,
     items: [
-      '  Import Wallet (Private Key)',
-      '  Set Trade Amount (USD range)',
-      '  Set Interval (seconds range)',
-      '  Back',
+      '  \u{1F511}  Import Wallet (Private Key)',
+      '  \u{1F4B0}  Set Token Address',
+      '  \u{1F527}  Set Pool Key (Manual)',
+      '  \u25CF  Set Min Trade Amount (USD)',
+      '  \u25CF  Set Max Trade Amount (USD)',
+      '  \u25CF  Set Min Interval (seconds)',
+      '  \u25CF  Set Max Interval (seconds)',
+      '  \u2190  Back',
     ],
   });
 
   blessed.text({
     parent: overlay, bottom: 1, left: 2, right: 2, height: 1, tags: true,
     content: '{gray-fg}Enter: select   Esc: back{/gray-fg}',
-    style: { bg: '#161b22' },
+    style: { bg: C.bgAlt },
   });
 
   screen.append(overlay);
   settingsList.focus();
   screen.render();
 
-  function askInput(label, defaultVal, censor, cb) {
-    const inp = blessed.textbox({
-      top: 'center', left: 'center', width: 54, height: 5,
-      label: '  ' + label + '  ',
-      tags: true, border: { type: 'line' },
-      style: { bg: '#0d1117', border: { fg: '#58a6ff' }, fg: 'white' },
-      inputOnFocus: true,
-      censor: !!censor,
-    });
-    screen.append(inp);
-    inp.focus();
-    screen.render();
-    inp.on('submit', (v) => { inp.destroy(); cb(v.trim()); });
-    inp.key(['escape'], () => { inp.destroy(); settingsList.focus(); screen.render(); });
-  }
-
   settingsList.on('select', (item, idx) => {
-    if (idx === 3) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
+    // Back
+    if (idx === 7) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
 
-    if (idx === 0) {
-      askInput('Private Key (hidden):', '', true, (v) => {
+    // Token Address
+    if (idx === 1) {
+      const inputBox = blessed.textbox({
+        top: 'center', left: 'center', width: 56, height: 5,
+        label: '  Token contract address (0x...):  ',
+        tags: true, border: { type: 'line' },
+        style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
+        inputOnFocus: true,
+      });
+      screen.append(inputBox);
+      inputBox.focus();
+      screen.render();
+
+      inputBox.on('submit', async (val) => {
+        inputBox.destroy();
+        screen.render();
+        const addr = val.trim();
+        if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) {
+          addLog('{red-fg}\u2717 Invalid address format{/red-fg}');
+          settingsList.focus(); screen.render();
+          return;
+        }
+        addLog('{gray-fg}\u23F3 Fetching token info...{/gray-fg}');
         try {
-          const w = new ethers.Wallet(v);
-          updateUser(USER_ID, { wallet_encrypted: encrypt(v), wallet_address: w.address });
-          const envPath = require('path').join(__dirname, '.env');
-          let envRaw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
-          envRaw = envRaw.match(/^PRIVATE_KEY=/m)
-            ? envRaw.replace(/^PRIVATE_KEY=.*/m, 'PRIVATE_KEY=' + v)
-            : envRaw + '\nPRIVATE_KEY=' + v;
-          fs.writeFileSync(envPath, envRaw);
-          addLog('{green-fg}OK{/green-fg}    Wallet: {cyan-fg}' + w.address + '{/cyan-fg}');
-        } catch (e) { addLog('{red-fg}ERR{/red-fg}   ' + e.message); }
+          const info = await trader.getTokenInfo(addr);
+          addLog(`{green-fg}\u2713{/green-fg} Token: {cyan-fg}${info.symbol}{/cyan-fg} (${info.decimals} decimals)`);
+          updateUser(USER_ID, { token_address: addr, token_symbol: info.symbol, token_decimals: info.decimals });
+
+          addLog('{gray-fg}\u23F3 Discovering V4 pool... (may take a moment){/gray-fg}');
+          const poolKey = await trader.discoverPoolKey(addr);
+          if (poolKey) {
+            updateUser(USER_ID, { fee_tier: poolKey.fee, tick_spacing: poolKey.tickSpacing, hook_address: poolKey.hooks });
+            addLog(`{green-fg}\u2713 Pool found!{/green-fg}  Fee: ${poolKey.fee}  Spacing: ${poolKey.tickSpacing}`);
+          } else {
+            addLog('{yellow-fg}\u26A0 No V4 pool found \u2014 use SETTINGS \u2192 Set Pool Key (Manual){/yellow-fg}');
+          }
+        } catch (e) {
+          addLog(`{red-fg}\u2717 Error: ${(e.shortMessage || e.message || '').slice(0,60)}{/red-fg}`);
+        }
         updateInfo(); refreshBalances();
         overlay.destroy(); menuBox.focus(); screen.render();
       });
 
-    } else if (idx === 1) {
-      const u = getUser(USER_ID) || {};
-      askInput('Min Amount USD (e.g. 0.10):', String(u.min_amount_usd || 0.10), false, (minV) => {
-        askInput('Max Amount USD (e.g. 0.50):', String(u.max_amount_usd || 0.50), false, (maxV) => {
-          updateUser(USER_ID, { min_amount_usd: parseFloat(minV), max_amount_usd: parseFloat(maxV) });
-          addLog('{green-fg}OK{/green-fg}    Amount: {yellow-fg}$' + minV + ' - $' + maxV + '{/yellow-fg}');
-          updateInfo();
-          overlay.destroy(); menuBox.focus(); screen.render();
-        });
+      inputBox.key(['escape'], () => { inputBox.destroy(); settingsList.focus(); screen.render(); });
+      return;
+    }
+
+    // Pool Key (Manual)
+    if (idx === 2) {
+      const inputBox = blessed.textbox({
+        top: 'center', left: 'center', width: 58, height: 5,
+        label: '  fee tickSpacing [hooks] (e.g. 3000 60):  ',
+        tags: true, border: { type: 'line' },
+        style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
+        inputOnFocus: true,
+      });
+      screen.append(inputBox);
+      inputBox.focus();
+      screen.render();
+
+      inputBox.on('submit', (val) => {
+        inputBox.destroy();
+        const parts = val.trim().split(/\s+/);
+        const fee = parseInt(parts[0]);
+        const tickSpacing = parseInt(parts[1]);
+        const hooks = parts[2] || '0x0000000000000000000000000000000000000000';
+        if (isNaN(fee) || isNaN(tickSpacing)) {
+          addLog('{red-fg}\u2717 Invalid format. Use: fee tickSpacing [hooks]{/red-fg}');
+          settingsList.focus(); screen.render();
+          return;
+        }
+        if (hooks !== '0x0000000000000000000000000000000000000000' && !/^0x[0-9a-fA-F]{40}$/.test(hooks)) {
+          addLog('{red-fg}\u2717 Invalid hooks address{/red-fg}');
+          settingsList.focus(); screen.render();
+          return;
+        }
+        updateUser(USER_ID, { fee_tier: fee, tick_spacing: tickSpacing, hook_address: hooks });
+        addLog(`{green-fg}\u2713{/green-fg} Pool key set: Fee=${fee} Spacing=${tickSpacing} Hooks=${hooks.slice(0,10)}...`);
+        updateInfo();
+        overlay.destroy(); menuBox.focus(); screen.render();
       });
 
-    } else if (idx === 2) {
-      const u = getUser(USER_ID) || {};
-      askInput('Min Interval seconds (e.g. 10):', String(u.min_interval_sec || 20), false, (minV) => {
-        askInput('Max Interval seconds (e.g. 30):', String(u.max_interval_sec || 60), false, (maxV) => {
-          updateUser(USER_ID, { min_interval_sec: parseInt(minV), max_interval_sec: parseInt(maxV) });
-          addLog('{green-fg}OK{/green-fg}    Interval: {yellow-fg}' + minV + 's - ' + maxV + 's{/yellow-fg}');
-          updateInfo();
-          overlay.destroy(); menuBox.focus(); screen.render();
-        });
-      });
+      inputBox.key(['escape'], () => { inputBox.destroy(); settingsList.focus(); screen.render(); });
+      return;
     }
+
+    // Wallet import and numeric settings
+    const labels = [
+      'Private Key (hidden):',
+      '', // token handled above
+      '', // pool key handled above
+      'Min Amount USD (e.g. 0.10):',
+      'Max Amount USD (e.g. 0.50):',
+      'Min Interval sec (e.g. 10):',
+      'Max Interval sec (e.g. 30):',
+    ];
+
+    const inputBox = blessed.textbox({
+      top: 'center', left: 'center', width: 54, height: 5,
+      label: `  ${labels[idx]}  `,
+      tags: true, border: { type: 'line' },
+      style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
+      inputOnFocus: true,
+      censor: idx === 0,
+    });
+
+    screen.append(inputBox);
+    inputBox.focus();
+    screen.render();
+
+    inputBox.on('submit', (val) => {
+      inputBox.destroy();
+      const v = val.trim();
+      try {
+        if (idx === 0) {
+          const w = new ethers.Wallet(v);
+          updateUser(USER_ID, { wallet_encrypted: encrypt(v), wallet_address: w.address });
+          const envPath = path.join(__dirname, '.env');
+          let envRaw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+          envRaw = envRaw.match(/^PRIVATE_KEY=/m)
+            ? envRaw.replace(/^PRIVATE_KEY=.*/m, `PRIVATE_KEY=${v}`)
+            : envRaw + `\nPRIVATE_KEY=${v}`;
+          fs.writeFileSync(envPath, envRaw);
+          addLog(`{green-fg}\u2713{/green-fg} Wallet: {cyan-fg}${w.address}{/cyan-fg}`);
+        } else if (idx === 3) { updateUser(USER_ID, { min_amount_usd: parseFloat(v) }); addLog(`{green-fg}\u2713{/green-fg} Min amount: $${v}`); }
+        else if (idx === 4) { updateUser(USER_ID, { max_amount_usd: parseFloat(v) }); addLog(`{green-fg}\u2713{/green-fg} Max amount: $${v}`); }
+        else if (idx === 5) { updateUser(USER_ID, { min_interval_sec: parseInt(v) }); addLog(`{green-fg}\u2713{/green-fg} Min interval: ${v}s`); }
+        else if (idx === 6) { updateUser(USER_ID, { max_interval_sec: parseInt(v) }); addLog(`{green-fg}\u2713{/green-fg} Max interval: ${v}s`); }
+      } catch (e) { addLog(`{red-fg}\u2717 ${(e.shortMessage || e.message || '').slice(0,60)}{/red-fg}`); }
+      updateInfo(); refreshBalances();
+      overlay.destroy(); menuBox.focus(); screen.render();
+    });
+
+    inputBox.key(['escape'], () => { inputBox.destroy(); settingsList.focus(); screen.render(); });
   });
 
   settingsList.key(['escape', 'q'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
@@ -404,12 +733,11 @@ function openSettings() {
 
 
 menuBox.on('select', (item, idx) => {
-  const u = getUser(USER_ID);
   const actions = [
     () => startBot(),
     () => stopBot(),
-    () => doBuy(randomBetween(u?.min_amount_usd || 0.1, u?.max_amount_usd || 0.5)),
-    () => doSell(100),
+    () => openBuyMenu(),
+    () => openSellMenu(),
     () => openSettings(),
     () => { stopBot(); screen.destroy(); process.exit(0); },
   ];
@@ -417,19 +745,20 @@ menuBox.on('select', (item, idx) => {
 });
 
 // ─── GLOBAL KEYS ──────────────────────────────────────────────────────────────
-screen.key(['r', 'R'], () => { addLog('{gray-fg}Refreshing...{/gray-fg}'); refreshBalances(); });
+screen.key(['r', 'R'], () => { addLog('{gray-fg}\u{1F504} Refreshing...{/gray-fg}'); refreshBalances(); });
 screen.key(['q', 'Q'], () => { stopBot(); screen.destroy(); process.exit(0); });
 screen.key('C-c',      () => { stopBot(); screen.destroy(); process.exit(0); });
 
-// ─── CLOCK ───────────────────────────────────────────────────────────────────
+// ─── CLOCK + AUTO-REFRESH ───────────────────────────────────────────────────
 setInterval(updateTopBar, 1000);
+setInterval(() => { if (!pendingMsg) refreshBalances(); }, 30000);
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 const user0 = getUser(USER_ID);
 addLog(user0?.wallet_address
-  ? `{cyan-fg}Wallet loaded: ${user0.wallet_address.slice(0,10)}...${user0.wallet_address.slice(-6)}{/cyan-fg}`
-  : '{yellow-fg}No wallet — go to SETTINGS to import your private key{/yellow-fg}');
-addLog('{gray-fg}Navigate with Up/Down, press Enter to select.{/gray-fg}');
+  ? `{cyan-fg}\u{1F511} Wallet loaded: ${user0.wallet_address.slice(0,10)}...${user0.wallet_address.slice(-6)}{/cyan-fg}`
+  : '{yellow-fg}\u26A0 No wallet \u2014 go to SETTINGS to import your private key{/yellow-fg}');
+addLog('{gray-fg}Navigate with \u2191/\u2193, press Enter to select.{/gray-fg}');
 updateTopBar();
 updateInfo();
 refreshBalances();
