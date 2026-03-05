@@ -380,9 +380,23 @@ if (!getUser(USER_ID)) {
   createUser(USER_ID);
 }
 
+// Auto-import wallet from .env PRIVATE_KEY if set and not yet imported
+(function autoImportWallet() {
+  const user = getUser(USER_ID);
+  if (!user.wallet_encrypted && process.env.PRIVATE_KEY) {
+    try {
+      const w = new ethers.Wallet(process.env.PRIVATE_KEY);
+      updateUser(USER_ID, { wallet_encrypted: encrypt(process.env.PRIVATE_KEY), wallet_address: w.address });
+      console.log('Auto-imported wallet from .env: ' + w.address);
+    } catch {}
+  }
+})();
+
 screen.render();
 addLog('Ready. Use UP/DOWN arrows to navigate, ENTER to select.');
 refreshInfo();
+
+
 
 
 
