@@ -306,7 +306,7 @@ async function doSell(pct) {
 // ─── SETTINGS ────────────────────────────────────────────────────────────────
 function openSettings() {
   const overlay = blessed.box({
-    top: 'center', left: 'center', width: 52, height: 18,
+    top: 'center', left: 'center', width: 52, height: 12,
     tags: true, border: { type: 'line' },
     label: ' {bold}{magenta-fg} SETTINGS {/magenta-fg}{/bold} ',
     style: { bg: '#161b22', border: { fg: '#58a6ff' } },
@@ -314,7 +314,7 @@ function openSettings() {
 
   const settingsList = blessed.list({
     parent: overlay,
-    top: 1, left: 1, right: 1, bottom: 4,
+    top: 1, left: 1, right: 1, bottom: 3,
     tags: true,
     style: {
       bg: '#161b22', fg: '#c9d1d9',
@@ -323,18 +323,14 @@ function openSettings() {
     keys: true, mouse: true,
     items: [
       '  Import Wallet (Private Key)',
-      '  Set Min Trade Amount (USD)',
-      '  Set Max Trade Amount (USD)',
-      '  Set Min Interval (seconds)',
-      '  Set Max Interval (seconds)',
+      '  Set Trade Amount (USD range)',
+      '  Set Interval (seconds range)',
       '  Back',
     ],
   });
 
-  const hint = blessed.text({
-    parent: overlay,
-    bottom: 1, left: 2, right: 2,
-    tags: true, height: 2,
+  blessed.text({
+    parent: overlay, bottom: 1, left: 2, right: 2, height: 1, tags: true,
     content: '{gray-fg}Enter: select   Esc: back{/gray-fg}',
     style: { bg: '#161b22' },
   });
@@ -343,62 +339,70 @@ function openSettings() {
   settingsList.focus();
   screen.render();
 
-  settingsList.on('select', (item, idx) => {
-    if (idx === 5) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
-
-    const labels = [
-      'Private Key (hidden):',
-      'Min Amount USD (e.g. 0.10):',
-      'Max Amount USD (e.g. 0.50):',
-      'Min Interval sec (e.g. 10):',
-      'Max Interval sec (e.g. 30):',
-    ];
-
-    const inputBox = blessed.textbox({
+  function askInput(label, defaultVal, censor, cb) {
+    const inp = blessed.textbox({
       top: 'center', left: 'center', width: 54, height: 5,
-      label: `  ${labels[idx]}  `,
+      label: '  ' + label + '  ',
       tags: true, border: { type: 'line' },
       style: { bg: '#0d1117', border: { fg: '#58a6ff' }, fg: 'white' },
       inputOnFocus: true,
-      censor: idx === 0,
+      censor: !!censor,
     });
-
-    screen.append(inputBox);
-    inputBox.focus();
+    screen.append(inp);
+    inp.focus();
     screen.render();
+    inp.on('submit', (v) => { inp.destroy(); cb(v.trim()); });
+    inp.key(['escape'], () => { inp.destroy(); settingsList.focus(); screen.render(); });
+  }
 
-    inputBox.on('submit', (val) => {
-      inputBox.destroy();
-      const v = val.trim();
-      try {
-        const user = getUser(USER_ID);
-        if (idx === 0) {
+  settingsList.on('select', (item, idx) => {
+    if (idx === 3) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
+
+    if (idx === 0) {
+      askInput('Private Key (hidden):', '', true, (v) => {
+        try {
           const w = new ethers.Wallet(v);
           updateUser(USER_ID, { wallet_encrypted: encrypt(v), wallet_address: w.address });
-          // Save to .env
-          const envPath = path.join(__dirname, '.env');
+          const envPath = require('path').join(__dirname, '.env');
           let envRaw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
           envRaw = envRaw.match(/^PRIVATE_KEY=/m)
-            ? envRaw.replace(/^PRIVATE_KEY=.*/m, `PRIVATE_KEY=${v}`)
-            : envRaw + `\nPRIVATE_KEY=${v}`;
+            ? envRaw.replace(/^PRIVATE_KEY=.*/m, 'PRIVATE_KEY=' + v)
+            : envRaw + '\nPRIVATE_KEY=' + v;
           fs.writeFileSync(envPath, envRaw);
-          addLog(`{green-fg}OK{/green-fg}    Wallet: {cyan-fg}${w.address}{/cyan-fg} (saved to .env)`);
-        } else if (idx === 1) { updateUser(USER_ID, { min_amount_usd: parseFloat(v) }); addLog(`{green-fg}OK{/green-fg}    Min amount: $${v}`); }
-        else if (idx === 2) { updateUser(USER_ID, { max_amount_usd: parseFloat(v) }); addLog(`{green-fg}OK{/green-fg}    Max amount: $${v}`); }
-        else if (idx === 3) { updateUser(USER_ID, { min_interval_sec: parseInt(v) }); addLog(`{green-fg}OK{/green-fg}    Min interval: ${v}s`); }
-        else if (idx === 4) { updateUser(USER_ID, { max_interval_sec: parseInt(v) }); addLog(`{green-fg}OK{/green-fg}    Max interval: ${v}s`); }
-      } catch (e) { addLog(`{red-fg}ERR{/red-fg}   ${e.message}`); }
-      updateInfo(); refreshBalances();
-      overlay.destroy(); menuBox.focus(); screen.render();
-    });
+          addLog('{green-fg}OK{/green-fg}    Wallet: {cyan-fg}' + w.address + '{/cyan-fg}');
+        } catch (e) { addLog('{red-fg}ERR{/red-fg}   ' + e.message); }
+        updateInfo(); refreshBalances();
+        overlay.destroy(); menuBox.focus(); screen.render();
+      });
 
-    inputBox.key(['escape'], () => { inputBox.destroy(); settingsList.focus(); screen.render(); });
+    } else if (idx === 1) {
+      const u = getUser(USER_ID) || {};
+      askInput('Min Amount USD (e.g. 0.10):', String(u.min_amount_usd || 0.10), false, (minV) => {
+        askInput('Max Amount USD (e.g. 0.50):', String(u.max_amount_usd || 0.50), false, (maxV) => {
+          updateUser(USER_ID, { min_amount_usd: parseFloat(minV), max_amount_usd: parseFloat(maxV) });
+          addLog('{green-fg}OK{/green-fg}    Amount: {yellow-fg}$' + minV + ' - $' + maxV + '{/yellow-fg}');
+          updateInfo();
+          overlay.destroy(); menuBox.focus(); screen.render();
+        });
+      });
+
+    } else if (idx === 2) {
+      const u = getUser(USER_ID) || {};
+      askInput('Min Interval seconds (e.g. 10):', String(u.min_interval_sec || 20), false, (minV) => {
+        askInput('Max Interval seconds (e.g. 30):', String(u.max_interval_sec || 60), false, (maxV) => {
+          updateUser(USER_ID, { min_interval_sec: parseInt(minV), max_interval_sec: parseInt(maxV) });
+          addLog('{green-fg}OK{/green-fg}    Interval: {yellow-fg}' + minV + 's - ' + maxV + 's{/yellow-fg}');
+          updateInfo();
+          overlay.destroy(); menuBox.focus(); screen.render();
+        });
+      });
+    }
   });
 
   settingsList.key(['escape', 'q'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
 }
 
-// ─── MENU ACTIONS ─────────────────────────────────────────────────────────────
+
 menuBox.on('select', (item, idx) => {
   const u = getUser(USER_ID);
   const actions = [
@@ -430,3 +434,5 @@ updateTopBar();
 updateInfo();
 refreshBalances();
 screen.render();
+
+
