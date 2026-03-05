@@ -119,7 +119,7 @@ function addLog(msg) {
 
 // ─── Info Refresh ─────────────────────────────────────────────────────────────
 async function refreshInfo() {
-  const user   = getUser(USER_ID);
+  const user   = getUser(USER_ID) || {};
   const status = running ? '{green-fg}[ RUNNING ]{/green-fg}' : '{red-fg}[ STOPPED ]{/red-fg}';
   const wallet = user.wallet_address
     ? `${user.wallet_address.slice(0,10)}...${user.wallet_address.slice(-6)}`
@@ -374,9 +374,17 @@ screen.key('C-c', () => {
 });
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
+// Auto-create user on first run (no users.json on fresh clone)
+const { createUser } = require('./db');
+if (!getUser(USER_ID)) {
+  createUser(USER_ID);
+}
+
 screen.render();
 addLog('Ready. Use UP/DOWN arrows to navigate, ENTER to select.');
 refreshInfo();
+
+
 
 
 
