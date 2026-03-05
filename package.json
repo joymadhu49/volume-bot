@@ -1,0 +1,17 @@
+{
+  "name": "chainsoul-volume-bot",
+  "version": "1.0.0",
+  "description": "Automated token volume bot with Telegram UI",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81",
+    "chalk": "^5.6.2",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.0",
+    "inquirer": "^13.3.0",
+    "telegraf": "^4.16.3"
+  }
+}
