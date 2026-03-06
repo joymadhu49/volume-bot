@@ -81,8 +81,17 @@ Example with a custom hook: `8388608 200 0xbB7784A4d481184283Ed89619A3e3ed143e1A
 - **START BOT** — auto buy/sell loop using your configured settings
 - **STOP BOT** — pause the loop
 - **BUY TOKEN** — manual buy (random, custom amount, or preset $1/$5/$10)
-- **SELL TOKEN** — manual sell (25%, 50%, 75%, 100%, or custom %)
+- **SELL TOKEN** — manual sell (25%, 50%, 75%, 100%, custom %, or unwrap WETH → ETH)
 - **SETTINGS** — configure wallet, token, pool key, trade amounts, intervals
+
+---
+
+## Update
+
+Pull the latest version and install any new dependencies:
+```bash
+cd volume-bot && git pull && npm install
+```
 
 ---
 
