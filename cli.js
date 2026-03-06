@@ -395,6 +395,21 @@ async function doSell(pct) {
   if (wasRunning) startBot();
 }
 
+async function doUnwrapWETH() {
+  const user = getUser(USER_ID);
+  if (!user?.wallet_encrypted) { addLog('{red-fg}\u2717 No wallet \u2014 go to SETTINGS{/red-fg}'); return; }
+  pendingMsg = 'Unwrapping WETH...'; updateTopBar();
+  addLog('{yellow-fg}\u{1F504} UNWRAP{/yellow-fg}  WETH \u2192 ETH');
+  try {
+    const pk = decrypt(user.wallet_encrypted);
+    const wallet = new ethers.Wallet(pk, new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org'));
+    await trader.unwrapWETH(wallet);
+    addLog('{green-fg}\u2713 UNWRAP OK{/green-fg}  WETH converted to ETH');
+    await refreshBalances();
+  } catch (e) { addLog(`{red-fg}\u2717 ERR{/red-fg}   ${(e.shortMessage || e.reason || e.message || '').slice(0, 60)}`); }
+  pendingMsg = ''; updateTopBar();
+}
+
 // ─── BUY MENU ───────────────────────────────────────────────────────────────
 function openBuyMenu() {
   const user = getUser(USER_ID) || {};
@@ -500,6 +515,7 @@ function openSellMenu() {
       '  \u25CF  Sell 75%',
       '  \u25CF  Sell 100%',
       '  \u270E  Custom %',
+      '  \u{1F504}  Unwrap WETH \u2192 ETH',
       '  \u2190  Back',
     ],
   });
@@ -517,11 +533,17 @@ function openSellMenu() {
   screen.render();
 
   sellList.on('select', (item, idx) => {
-    if (idx === 5) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
+    if (idx === 6) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
     if (idx >= 0 && idx <= 3) {
       const pcts = [25, 50, 75, 100];
       overlay.destroy(); menuBox.focus(); screen.render();
       doSell(pcts[idx]);
+      return;
+    }
+    // idx === 5: unwrap WETH
+    if (idx === 5) {
+      overlay.destroy(); menuBox.focus(); screen.render();
+      doUnwrapWETH();
       return;
     }
     // idx === 4: custom %

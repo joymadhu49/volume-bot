@@ -166,6 +166,7 @@ bot.action('sell_menu', async (ctx) => {
           Markup.button.callback('75%',  'sell_75'),
           Markup.button.callback('100%', 'sell_100'),
         ],
+        [Markup.button.callback('🔄 Unwrap WETH → ETH', 'unwrap_weth')],
         [Markup.button.callback('🔙 Back', 'back_main')],
       ]),
     }
@@ -193,6 +194,22 @@ bot.action('sell_25',  (ctx) => executeSell(ctx, 25));
 bot.action('sell_50',  (ctx) => executeSell(ctx, 50));
 bot.action('sell_75',  (ctx) => executeSell(ctx, 75));
 bot.action('sell_100', (ctx) => executeSell(ctx, 100));
+
+bot.action('unwrap_weth', async (ctx) => {
+  await ctx.answerCbQuery('Unwrapping WETH...');
+  const user = getUser(ctx.from.id);
+  if (!user?.wallet_encrypted) return ctx.reply('⚠️ Import a wallet first.');
+  try {
+    await ctx.reply('⏳ Unwrapping WETH → ETH...');
+    const pk = decrypt(user.wallet_encrypted);
+    const { ethers } = require('ethers');
+    const wallet = new ethers.Wallet(pk, new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org'));
+    await trader.unwrapWETH(wallet);
+    await ctx.reply('✅ WETH unwrapped to ETH!');
+  } catch (err) {
+    await ctx.reply(`❌ Unwrap failed: ${err.message}`);
+  }
+});
 
 // ─── SETTINGS ────────────────────────────────────────────────────────────────
 
