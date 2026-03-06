@@ -250,7 +250,7 @@ async function sellToken(privateKey, tokenAddress, percentage, _feeTier, decimal
   const erc20Allow = await token.allowance(wallet.address, PERMIT2);
   if (erc20Allow < amountIn) {
     await sendTx(wallet, {
-      to:       PERMIT2,
+      to:       tokenAddress,
       data:     token.interface.encodeFunctionData('approve', [PERMIT2, ethers.MaxUint256]),
       gasLimit: 100000n,
     });
