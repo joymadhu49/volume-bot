@@ -1,8 +1,38 @@
 require('dotenv').config();
+const fs   = require('fs');
+const path = require('path');
+const { ethers } = require('ethers');
 const { Telegraf, Markup, session } = require('telegraf');
 const { getUser, createUser, updateUser, getWallets } = require('./db');
 const { encrypt, decrypt, importWallet, getEthPrice, randomBetween, shortAddress } = require('./utils');
 const trader = require('./trader');
+
+// Auto-import wallets from wallets.txt for all existing users
+(function autoImportFromFile() {
+  const filePath = path.join(__dirname, 'wallets.txt');
+  if (!fs.existsSync(filePath)) return;
+  const lines = fs.readFileSync(filePath, 'utf8').split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+  if (lines.length === 0) return;
+  // Import for the default CLI user as well
+  const db = require('./db');
+  const userId = 7332734457;
+  if (!db.getUser(userId)) db.createUser(userId);
+  const current = db.getWallets(userId);
+  let added = 0;
+  for (const line of lines) {
+    try {
+      const w = new ethers.Wallet(line);
+      if (!current.some(x => x.address.toLowerCase() === w.address.toLowerCase())) {
+        current.push({ encrypted: encrypt(line), address: w.address });
+        added++;
+      }
+    } catch {}
+  }
+  if (added > 0) {
+    db.updateUser(userId, { wallets: current, wallet_encrypted: current[0].encrypted, wallet_address: current[0].address });
+    console.log(`Auto-imported ${added} wallets from wallets.txt (${current.length} total)`);
+  }
+})();
 
 // Build poolKey object from user DB fields
 function poolKeyFromUser(user) {

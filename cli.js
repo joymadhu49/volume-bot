@@ -69,6 +69,27 @@ if (!getUser(USER_ID)) createUser(USER_ID);
     updateUser(USER_ID, { wallets: [{ encrypted: u.wallet_encrypted, address: u.wallet_address }] });
   }
 })();
+// Auto-import wallets from wallets.txt on startup
+(function autoImportFromFile() {
+  const filePath = path.join(__dirname, 'wallets.txt');
+  if (!fs.existsSync(filePath)) return;
+  const lines = fs.readFileSync(filePath, 'utf8').split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+  if (lines.length === 0) return;
+  const current = getWallets(USER_ID);
+  let added = 0;
+  for (const line of lines) {
+    try {
+      const w = new ethers.Wallet(line);
+      if (!current.some(x => x.address.toLowerCase() === w.address.toLowerCase())) {
+        current.push({ encrypted: encrypt(line), address: w.address });
+        added++;
+      }
+    } catch {}
+  }
+  if (added > 0) {
+    updateUser(USER_ID, { wallets: current, wallet_encrypted: current[0].encrypted, wallet_address: current[0].address });
+  }
+})();
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
 const screen = blessed.screen({

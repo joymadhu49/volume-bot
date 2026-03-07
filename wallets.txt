@@ -1,0 +1,8 @@
+# Paste your wallet private keys below (one per line)
+# Lines starting with # are ignored
+# Supports up to 50+ wallets
+# The bot auto-imports these on startup
+#
+# Example:
+# 0xabc123...your_private_key_here
+# 0xdef456...another_private_key_here
