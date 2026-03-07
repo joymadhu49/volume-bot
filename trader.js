@@ -14,6 +14,7 @@ const POOL_MANAGER     = '0x498581ff718922c3f8e6a244956af099b2652b2b';
 const ACT_SWAP_EXACT_IN_SINGLE = 0x06;
 const ACT_SETTLE               = 0x0b; // settle exact amount (not SETTLE_ALL)
 const ACT_TAKE_ALL             = 0x0f;
+const ACT_TAKE_PORTION         = 0x0d; // take to specific recipient (for UNWRAP_WETH flow)
 
 // Universal Router special address constant
 const ADDRESS_THIS = '0x0000000000000000000000000000000000000002';
@@ -144,13 +145,13 @@ async function discoverPoolKey(tokenAddress) {
 
 // ─── Encode V4 Actions ────────────────────────────────────────────────────────
 
-function encodeV4Swap({ poolKey, zeroForOne, amountIn }) {
+function encodeV4Swap({ poolKey, zeroForOne, amountIn, takeToRouter = false }) {
   const abi = ethers.AbiCoder.defaultAbiCoder();
 
   const actions = ethers.concat([
     new Uint8Array([ACT_SWAP_EXACT_IN_SINGLE]),
     new Uint8Array([ACT_SETTLE]),
-    new Uint8Array([ACT_TAKE_ALL]),
+    new Uint8Array([takeToRouter ? ACT_TAKE_PORTION : ACT_TAKE_ALL]),
   ]);
 
   const swapParam = abi.encode(
@@ -167,10 +168,14 @@ function encodeV4Swap({ poolKey, zeroForOne, amountIn }) {
   const settleCurrency = zeroForOne ? poolKey.currency0 : poolKey.currency1;
   const takeCurrency   = zeroForOne ? poolKey.currency1 : poolKey.currency0;
 
-  // SETTLE(currency, amount, payerIsUser=false) — router pays from its own WETH (after WRAP_ETH)
+  // SETTLE(currency, amount, payerIsUser=false) — router pays from its own balance
   const settleParam = abi.encode(['address', 'uint256', 'bool'], [settleCurrency, amountIn, false]);
-  // TAKE_ALL(currency, minAmount)
-  const takeParam   = abi.encode(['address', 'uint256'], [takeCurrency, 0n]);
+
+  // When takeToRouter=true: TAKE_PORTION to ADDRESS_THIS (router) so UNWRAP_WETH can convert it
+  // When takeToRouter=false: TAKE_ALL to msgSender (user wallet)
+  const takeParam = takeToRouter
+    ? abi.encode(['address', 'address', 'uint256'], [takeCurrency, ADDRESS_THIS, 10000n])
+    : abi.encode(['address', 'uint256'], [takeCurrency, 0n]);
 
   // V4_SWAP input = abi.encode(actions, params[])
   return abi.encode(['bytes', 'bytes[]'], [actions, [swapParam, settleParam, takeParam]]);
@@ -275,28 +280,25 @@ async function sellToken(privateKey, tokenAddress, percentage, _feeTier, decimal
   }
 
   // PERMIT2_TRANSFER_FROM (0x02) + V4_SWAP (0x10) + UNWRAP_WETH (0x0c)
+  // takeToRouter=true keeps WETH in the router so UNWRAP_WETH can convert it to ETH
   const commands = '0x02100c';
 
   const transferInput = ethers.AbiCoder.defaultAbiCoder().encode(
     ['address', 'address', 'uint160'],
     [tokenAddress, UNIVERSAL_ROUTER, amountIn]
   );
-  const v4Input = encodeV4Swap({ poolKey, zeroForOne, amountIn });
+  const v4Input = encodeV4Swap({ poolKey, zeroForOne, amountIn, takeToRouter: true });
   const unwrapInput = ethers.AbiCoder.defaultAbiCoder().encode(
     ['address', 'uint256'],
     [wallet.address, 0n]
   );
 
   const deadline = Math.floor(Date.now() / 1000) + 300;
-  const receipt = await sendTx(wallet, {
+  return sendTx(wallet, {
     to:       UNIVERSAL_ROUTER,
     data:     new ethers.Interface(ROUTER_ABI).encodeFunctionData('execute', [commands, [transferInput, v4Input, unwrapInput], deadline]),
     gasLimit: 700000n,
   });
-
-  // Auto-unwrap any remaining WETH to ETH
-  await unwrapWETH(wallet);
-  return receipt;
 }
 
 // ─── Balances ────────────────────────────────────────────────────────────────
@@ -309,18 +311,14 @@ const WETH_ABI_EXTRA = [
 ];
 
 async function unwrapWETH(wallet) {
-  try {
-    const weth = new ethers.Contract(WETH, WETH_ABI_EXTRA, wallet);
-    const bal = await weth.balanceOf(wallet.address);
-    if (bal > 0n) {
-      await sendTx(wallet, {
-        to:       WETH,
-        data:     weth.interface.encodeFunctionData('withdraw', [bal]),
-        gasLimit: 60000n,
-      });
-    }
-  } catch {
-    // WETH unwrap failed silently — non-critical
+  const weth = new ethers.Contract(WETH, WETH_ABI_EXTRA, wallet);
+  const bal = await weth.balanceOf(wallet.address);
+  if (bal > 0n) {
+    await sendTx(wallet, {
+      to:       WETH,
+      data:     weth.interface.encodeFunctionData('withdraw', [bal]),
+      gasLimit: 60000n,
+    });
   }
 }
 

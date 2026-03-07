@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { Telegraf, Markup, session } = require('telegraf');
-const { getUser, createUser, updateUser } = require('./db');
+const { getUser, createUser, updateUser, getWallets } = require('./db');
 const { encrypt, decrypt, importWallet, getEthPrice, randomBetween, shortAddress } = require('./utils');
 const trader = require('./trader');
 
@@ -31,12 +31,13 @@ const activeBots = new Map();
 function mainMenuText(user, balances) {
   const running = activeBots.get(user.user_id)?.running;
   const status  = running ? '🟢 Running' : '🔴 Stopped';
-  const wallet  = user.wallet_address ? `\`${shortAddress(user.wallet_address)}\`` : '⚠️ Not set';
+  const wallets = getWallets(user.user_id);
+  const walletInfo = wallets.length > 0 ? `${wallets.length} wallet${wallets.length > 1 ? 's' : ''} loaded` : '⚠️ Not set';
   const token   = user.token_address  ? `\`${shortAddress(user.token_address)}\``  : '⚠️ Not set';
   const sym     = balances?.tokenSymbol || user.token_symbol || 'TOKEN';
 
   let text = `*🤖 ChainSoul Volume Bot*\n\n`;
-  text += `👛 Wallet: ${wallet}\n`;
+  text += `👛 Wallets: ${walletInfo}\n`;
   text += `🪙 Token: ${token}\n`;
 
   if (balances) {
@@ -115,8 +116,9 @@ bot.action('start_bot', async (ctx) => {
   const userId = ctx.from.id;
   const user   = getUser(userId);
 
-  if (!user.wallet_encrypted) return ctx.reply('⚠️ Import a wallet first — tap 👛 Wallet.');
-  if (!user.token_address)    return ctx.reply('⚠️ Set a token address first — tap ⚙️ Settings.');
+  const wallets = getWallets(userId);
+  if (wallets.length === 0) return ctx.reply('⚠️ Import wallets first — tap 👛 Wallet.');
+  if (!user.token_address)  return ctx.reply('⚠️ Set a token address first — tap ⚙️ Settings.');
   if (activeBots.get(userId)?.running) return ctx.answerCbQuery('Already running!');
 
   startTradingLoop(userId);
@@ -179,15 +181,23 @@ async function executeSell(ctx, percentage) {
   // Pause auto-loop to avoid nonce collision
   stopTradingLoop(userId);
   const user = getUser(userId);
-  try {
-    await ctx.reply(`⏳ Selling ${percentage}% of tokens...`);
-    const pk      = decrypt(user.wallet_encrypted);
-    const poolKey = poolKeyFromUser(user);
-    const receipt = await trader.sellToken(pk, user.token_address, percentage, null, user.token_decimals || 18, poolKey);
-    await ctx.reply(`✅ Sold ${percentage}%!\n\nTx: \`${receipt.hash}\``, { parse_mode: 'Markdown' });
-  } catch (err) {
-    await ctx.reply(`❌ Sell failed: ${err.message}`);
+  const wallets = getWallets(userId);
+  if (wallets.length === 0) return ctx.reply('⚠️ No wallets imported.');
+  const poolKey = poolKeyFromUser(user);
+  await ctx.reply(`⏳ Selling ${percentage}% from ${wallets.length} wallet${wallets.length > 1 ? 's' : ''}...`);
+  let sold = 0;
+  for (const wallet of wallets) {
+    try {
+      const pk = decrypt(wallet.encrypted);
+      const receipt = await trader.sellToken(pk, user.token_address, percentage, null, user.token_decimals || 18, poolKey);
+      sold++;
+      await ctx.reply(`✅ Sold ${percentage}% from \`${shortAddress(wallet.address)}\`\nTx: \`${receipt.hash}\``, { parse_mode: 'Markdown' });
+    } catch (err) {
+      if (!err.message.includes('No tokens'))
+        await ctx.reply(`❌ Sell failed for \`${shortAddress(wallet.address)}\`: ${err.message}`, { parse_mode: 'Markdown' });
+    }
   }
+  if (sold > 0) await ctx.reply(`✅ Sold from ${sold}/${wallets.length} wallets`);
 }
 
 bot.action('sell_25',  (ctx) => executeSell(ctx, 25));
@@ -197,18 +207,20 @@ bot.action('sell_100', (ctx) => executeSell(ctx, 100));
 
 bot.action('unwrap_weth', async (ctx) => {
   await ctx.answerCbQuery('Unwrapping WETH...');
-  const user = getUser(ctx.from.id);
-  if (!user?.wallet_encrypted) return ctx.reply('⚠️ Import a wallet first.');
-  try {
-    await ctx.reply('⏳ Unwrapping WETH → ETH...');
-    const pk = decrypt(user.wallet_encrypted);
-    const { ethers } = require('ethers');
-    const wallet = new ethers.Wallet(pk, new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org'));
-    await trader.unwrapWETH(wallet);
-    await ctx.reply('✅ WETH unwrapped to ETH!');
-  } catch (err) {
-    await ctx.reply(`❌ Unwrap failed: ${err.message}`);
+  const wallets = getWallets(ctx.from.id);
+  if (wallets.length === 0) return ctx.reply('⚠️ Import wallets first.');
+  await ctx.reply(`⏳ Unwrapping WETH → ETH from ${wallets.length} wallet${wallets.length > 1 ? 's' : ''}...`);
+  const { ethers } = require('ethers');
+  let unwrapped = 0;
+  for (const w of wallets) {
+    try {
+      const pk = decrypt(w.encrypted);
+      const wallet = new ethers.Wallet(pk, new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org'));
+      await trader.unwrapWETH(wallet);
+      unwrapped++;
+    } catch {}
   }
+  await ctx.reply(`✅ WETH unwrapped from ${unwrapped} wallets`);
 });
 
 // ─── SETTINGS ────────────────────────────────────────────────────────────────
@@ -309,20 +321,37 @@ bot.on('text', async (ctx) => {
   // Delete message for security (especially private keys)
   try { await ctx.deleteMessage(); } catch {}
 
-  // ── Private key
+  // ── Private key (supports multiple keys, one per line)
   if (waitingFor === 'private_key') {
-    try {
-      const { address, privateKey } = importWallet(input);
-      updateUser(userId, {
-        wallet_encrypted: encrypt(privateKey),
-        wallet_address: address,
-      });
+    const keys = input.split(/[\n,]+/).map(k => k.trim()).filter(Boolean);
+    const current = getWallets(userId);
+    let added = 0, skipped = 0, failed = 0;
+    for (const key of keys) {
+      try {
+        const { address, privateKey } = importWallet(key);
+        if (current.some(w => w.address.toLowerCase() === address.toLowerCase())) {
+          skipped++;
+        } else {
+          current.push({ encrypted: encrypt(privateKey), address });
+          added++;
+        }
+      } catch { failed++; }
+    }
+    updateUser(userId, {
+      wallets: current,
+      wallet_encrypted: current[0]?.encrypted || null,
+      wallet_address: current[0]?.address || null,
+    });
+    if (keys.length === 1 && added === 1) {
       await ctx.reply(
-        `✅ *Wallet imported!*\n\n📍 \`${address}\`\n\n_Always use a dedicated wallet for bots._`,
+        `✅ *Wallet imported!*\n\n📍 \`${current[current.length - 1].address}\`\n📊 ${current.length} total wallets\n\n_Always use dedicated wallets for bots._`,
         { parse_mode: 'Markdown' }
       );
-    } catch (err) {
-      await ctx.reply(`❌ Invalid private key: ${err.message}`);
+    } else {
+      await ctx.reply(
+        `✅ *Bulk import:* ${added} added, ${skipped} duplicates, ${failed} failed\n📊 ${current.length} total wallets`,
+        { parse_mode: 'Markdown' }
+      );
     }
   }
 
@@ -400,7 +429,8 @@ function startTradingLoop(userId) {
   async function doTrade() {
     if (!activeBots.get(userId)?.running) return;
     const user = getUser(userId);
-    if (!user?.wallet_encrypted || !user?.token_address) return;
+    const wallets = getWallets(userId);
+    if (wallets.length === 0 || !user?.token_address) return;
 
     try {
       const poolKey = poolKeyFromUser(user);
@@ -411,10 +441,12 @@ function startTradingLoop(userId) {
         return;
       }
 
+      const wallet    = wallets[Math.floor(Math.random() * wallets.length)];
+      const shortAddr = shortAddress(wallet.address);
       const ethPrice  = await getEthPrice();
       const usdAmount = randomBetween(user.min_amount_usd, user.max_amount_usd);
       const ethAmount = usdAmount / ethPrice;
-      const pk        = decrypt(user.wallet_encrypted);
+      const pk        = decrypt(wallet.encrypted);
       const decimals  = user.token_decimals || 18;
 
       // 70% buy, 30% sell for realistic two-sided volume
@@ -423,11 +455,12 @@ function startTradingLoop(userId) {
       if (isBuy) {
         const receipt = await trader.buyToken(pk, user.token_address, ethAmount, null, poolKey);
         const count = user.trade_count + 1;
-        console.log(`[${userId}] ✅ BUY $${usdAmount.toFixed(2)} | tx: ${receipt.hash}`);
+        console.log(`[${userId}] ✅ BUY $${usdAmount.toFixed(2)} [${shortAddr}] | tx: ${receipt.hash}`);
         updateUser(userId, { trade_count: count });
         bot.telegram.sendMessage(userId,
           `✅ *Trade #${count} complete!*\n\n` +
           `📈 BUY — $${usdAmount.toFixed(2)} worth of ${user.token_symbol || 'TOKEN'}\n` +
+          `👛 Wallet: \`${shortAddr}\`\n` +
           `🔗 [View on BaseScan](https://basescan.org/tx/${receipt.hash})`,
           { parse_mode: 'Markdown', disable_web_page_preview: true }
         ).catch(() => {});
@@ -435,11 +468,12 @@ function startTradingLoop(userId) {
         const sellPct = Math.floor(randomBetween(5, 15));
         const receipt = await trader.sellToken(pk, user.token_address, sellPct, null, decimals, poolKey);
         const count = user.trade_count + 1;
-        console.log(`[${userId}] ✅ SELL ${sellPct}% | tx: ${receipt.hash}`);
+        console.log(`[${userId}] ✅ SELL ${sellPct}% [${shortAddr}] | tx: ${receipt.hash}`);
         updateUser(userId, { trade_count: count });
         bot.telegram.sendMessage(userId,
           `✅ *Trade #${count} complete!*\n\n` +
           `📉 SELL — ${sellPct}% of ${user.token_symbol || 'TOKEN'}\n` +
+          `👛 Wallet: \`${shortAddr}\`\n` +
           `🔗 [View on BaseScan](https://basescan.org/tx/${receipt.hash})`,
           { parse_mode: 'Markdown', disable_web_page_preview: true }
         ).catch(() => {});

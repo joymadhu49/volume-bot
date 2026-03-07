@@ -13,7 +13,8 @@ function saveDB(data) {
 }
 
 const defaultUser = () => ({
-  wallet_encrypted:  null,
+  wallets:           [],     // [{ encrypted, address }]
+  wallet_encrypted:  null,   // legacy single-wallet (migrated to wallets[])
   wallet_address:    null,
   token_address:     null,
   token_symbol:      'TOKEN',
@@ -51,4 +52,12 @@ function updateUser(userId, data) {
   saveDB(db);
 }
 
-module.exports = { getUser, createUser, updateUser };
+function getWallets(userId) {
+  const user = getUser(userId);
+  if (!user) return [];
+  if (user.wallets && user.wallets.length > 0) return user.wallets;
+  if (user.wallet_encrypted) return [{ encrypted: user.wallet_encrypted, address: user.wallet_address }];
+  return [];
+}
+
+module.exports = { getUser, createUser, updateUser, getWallets };
