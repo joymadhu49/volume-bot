@@ -13,8 +13,7 @@ function saveDB(data) {
 }
 
 const defaultUser = () => ({
-  wallets:           [],     // [{ encrypted, address }]
-  wallet_encrypted:  null,   // legacy single-wallet (migrated to wallets[])
+  wallet_encrypted:  null,
   wallet_address:    null,
   token_address:     null,
   token_symbol:      'TOKEN',
@@ -55,7 +54,6 @@ function updateUser(userId, data) {
 function getWallets(userId) {
   const user = getUser(userId);
   if (!user) return [];
-  if (user.wallets && user.wallets.length > 0) return user.wallets;
   if (user.wallet_encrypted) return [{ encrypted: user.wallet_encrypted, address: user.wallet_address }];
   return [];
 }

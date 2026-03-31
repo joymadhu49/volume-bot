@@ -4,16 +4,17 @@ require('dotenv').config();
 
 const blessed = require('blessed');
 const { ethers } = require('ethers');
-const { getUser, updateUser, createUser, getWallets } = require('./db');
+const { getUser, updateUser, createUser } = require('./db');
 const { decrypt, encrypt, getEthPrice, randomBetween } = require('./utils');
 const trader  = require('./trader');
 const fs      = require('fs');
 const path    = require('path');
 
-const USER_ID = 7332734457;
-const WETH    = '0x4200000000000000000000000000000000000006';
+const USER_ID  = 7332734457;
+const WETH     = '0x4200000000000000000000000000000000000006';
+const BASESCAN = 'https://basescan.org/tx/';
 
-// ─── Pool Key Builder (mirrors index.js poolKeyFromUser) ─────────────────────
+// ─── Pool Key Builder ───────────────────────────────────────────────────
 function poolKeyFromUser(user) {
   if (user.fee_tier == null || user.tick_spacing == null || user.hook_address == null || !user.token_address) return null;
   const tokenLower = user.token_address.toLowerCase();
@@ -27,7 +28,7 @@ function poolKeyFromUser(user) {
   };
 }
 
-// ─── Color Palette ──────────────────────────────────────────────────────────
+// ─── Color Palette ──────────────────────────────────────────────────────
 const C = {
   bg:       '#0d1117',
   bgAlt:    '#161b22',
@@ -43,15 +44,16 @@ const C = {
   purple:   '#bc8cff',
 };
 
-// ─── State ───────────────────────────────────────────────────────────────────
+// ─── State ──────────────────────────────────────────────────────────────
 let running             = false;
 let tradeTimer          = null;
 let nextTradeIn         = 0;
 let totalCountdownSecs  = 0;
 let countdownTimer      = null;
 let pendingMsg          = '';
+let menuActions         = [];
 
-// ─── Auto-create + auto-import + migrate ────────────────────────────────────
+// ─── Auto-create + auto-import ──────────────────────────────────────────
 if (!getUser(USER_ID)) createUser(USER_ID);
 (function autoImport() {
   const u = getUser(USER_ID);
@@ -62,43 +64,15 @@ if (!getUser(USER_ID)) createUser(USER_ID);
     } catch {}
   }
 })();
-// Migrate legacy single wallet into wallets[]
-(function migrateWallets() {
-  const u = getUser(USER_ID);
-  if (u.wallet_encrypted && (!u.wallets || u.wallets.length === 0)) {
-    updateUser(USER_ID, { wallets: [{ encrypted: u.wallet_encrypted, address: u.wallet_address }] });
-  }
-})();
-// Auto-import wallets from wallets.txt on startup
-(function autoImportFromFile() {
-  const filePath = path.join(__dirname, 'wallets.txt');
-  if (!fs.existsSync(filePath)) return;
-  const lines = fs.readFileSync(filePath, 'utf8').split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-  if (lines.length === 0) return;
-  const current = getWallets(USER_ID);
-  let added = 0;
-  for (const line of lines) {
-    try {
-      const w = new ethers.Wallet(line);
-      if (!current.some(x => x.address.toLowerCase() === w.address.toLowerCase())) {
-        current.push({ encrypted: encrypt(line), address: w.address });
-        added++;
-      }
-    } catch {}
-  }
-  if (added > 0) {
-    updateUser(USER_ID, { wallets: current, wallet_encrypted: current[0].encrypted, wallet_address: current[0].address });
-  }
-})();
 
-// ─── Screen ──────────────────────────────────────────────────────────────────
+// ─── Screen ─────────────────────────────────────────────────────────────
 const screen = blessed.screen({
   smartCSR: true, title: 'Volume Bot',
   fullUnicode: true, forceUnicode: true,
   ignoreLocked: ['C-c'],
 });
 
-// ─── TOP BAR ─────────────────────────────────────────────────────────────────
+// ─── TOP BAR ────────────────────────────────────────────────────────────
 const topBar = blessed.box({
   top: 0, left: 0, width: '100%', height: 5,
   tags: true,
@@ -107,7 +81,7 @@ const topBar = blessed.box({
   padding: { left: 1 },
 });
 
-// ─── LEFT: Menu ──────────────────────────────────────────────────────────────
+// ─── LEFT: Menu ─────────────────────────────────────────────────────────
 const menuBox = blessed.list({
   top: 5, left: 0, width: '25%', height: '55%-5',
   label: ' {bold}{cyan-fg} ACTIONS {/cyan-fg}{/bold} ',
@@ -121,17 +95,10 @@ const menuBox = blessed.list({
   },
   keys: true, vi: false, mouse: true,
   padding: { left: 1, top: 1 },
-  items: [
-    ' \u25B6  START BOT',
-    ' \u25A0  STOP BOT',
-    ' \u2B06  BUY TOKEN',
-    ' \u2B07  SELL TOKEN',
-    ' \u2699  SETTINGS',
-    ' \u2716  QUIT',
-  ],
+  items: [],
 });
 
-// ─── RIGHT TOP: Balances ──────────────────────────────────────────────────────
+// ─── RIGHT TOP: Balances ────────────────────────────────────────────────
 const balBox = blessed.box({
   top: 5, right: 0, width: '75%', height: '25%',
   label: ' {bold}{yellow-fg} BALANCES {/yellow-fg}{/bold} ',
@@ -142,7 +109,7 @@ const balBox = blessed.box({
   content: '{gray-fg}Loading...{/gray-fg}',
 });
 
-// ─── RIGHT BOTTOM: Config Info ────────────────────────────────────────────────
+// ─── RIGHT BOTTOM: Config Info ──────────────────────────────────────────
 const infoBox = blessed.box({
   top: '25%+5', right: 0, width: '75%',
   bottom: '40%+3',
@@ -154,7 +121,7 @@ const infoBox = blessed.box({
   content: '',
 });
 
-// ─── TRADE LOG ───────────────────────────────────────────────────────────────
+// ─── TRADE LOG ──────────────────────────────────────────────────────────
 const logBox = blessed.log({
   bottom: 3, left: 0, width: '100%', height: '40%',
   label: ' {bold}{green-fg} TRADE LOG {/green-fg}{/bold} ',
@@ -166,13 +133,12 @@ const logBox = blessed.log({
   scrollbar: { ch: ' ', track: { bg: C.bgAlt } },
 });
 
-// ─── BOTTOM BAR ──────────────────────────────────────────────────────────────
+// ─── BOTTOM BAR ─────────────────────────────────────────────────────────
 const botBar = blessed.box({
   bottom: 0, left: 0, width: '100%', height: 3,
   tags: true,
   border: { type: 'line' },
   style: { bg: C.bgAlt, fg: C.dim, border: { fg: C.border } },
-  content: '{center}{gray-fg} \u2191/\u2193 Navigate    Enter Select    R Refresh    Q Quit {/gray-fg}{/center}',
 });
 
 screen.append(topBar);
@@ -183,17 +149,79 @@ screen.append(logBox);
 screen.append(botBar);
 menuBox.focus();
 
-// ─── PROGRESS BAR ───────────────────────────────────────────────────────────
+// ─── Dynamic Menu Builder ───────────────────────────────────────────────
+function rebuildMenu() {
+  const user = getUser(USER_ID) || {};
+  const hasWallet = !!user.wallet_encrypted;
+  const hasToken  = !!user.token_address;
+  const hasPool   = !!poolKeyFromUser(user);
+  const sym       = user.token_symbol || 'TOKEN';
+  const ready     = hasWallet && hasPool;
+
+  const prevIdx = menuBox.selected || 0;
+  const items   = [];
+  menuActions   = [];
+
+  if (!hasWallet || !hasToken) {
+    items.push(' \u26A1  QUICK SETUP');
+    menuActions.push(() => openWizard());
+  }
+
+  if (ready) {
+    if (running) {
+      items.push(' \u25A0  STOP BOT');
+      menuActions.push(() => stopBot());
+    } else {
+      items.push(' \u25B6  START BOT');
+      menuActions.push(() => startBot());
+    }
+  }
+
+  if (hasWallet) {
+    items.push(` \u2B06  BUY ${hasToken ? sym : 'TOKEN'}`);
+    menuActions.push(() => openBuyMenu());
+    items.push(` \u2B07  SELL ${hasToken ? sym : 'TOKEN'}`);
+    menuActions.push(() => openSellMenu());
+  }
+
+  if ((user.trade_history || []).length > 0) {
+    items.push(' \u2502  TRADE HISTORY');
+    menuActions.push(() => openTradeHistory());
+  }
+
+  items.push(' \u2699  SETTINGS');
+  menuActions.push(() => openSettings());
+  items.push(' \u2716  QUIT');
+  menuActions.push(() => { stopBot(); screen.destroy(); process.exit(0); });
+
+  menuBox.setItems(items);
+  menuBox.select(Math.min(prevIdx, items.length - 1));
+  updateBottomBar();
+  screen.render();
+}
+
+function updateBottomBar() {
+  const user = getUser(USER_ID) || {};
+  const hasWallet = !!user.wallet_encrypted;
+  const ready     = hasWallet && !!poolKeyFromUser(user);
+  let hints = '{gray-fg} \u2191/\u2193 Navigate   Enter Select   R Refresh   Q Quit';
+  if (ready)     hints += '   Space Start/Stop';
+  if (hasWallet) hints += '   B Buy   S Sell';
+  hints += ' {/gray-fg}';
+  botBar.setContent(`{center}${hints}{/center}`);
+}
+
+// ─── PROGRESS BAR ───────────────────────────────────────────────────────
 function makeProgressBar(current, total, width) {
   width = width || 15;
   if (total <= 0) return '';
   const filled = Math.round((1 - current / total) * width);
-  const empty = width - filled;
+  const empty  = width - filled;
   return '{green-fg}' + '\u2588'.repeat(filled) + '{/green-fg}' +
-         '{gray-fg}' + '\u2591'.repeat(empty) + '{/gray-fg}';
+         '{gray-fg}' + '\u2591'.repeat(empty)  + '{/gray-fg}';
 }
 
-// ─── TOP BAR UPDATE ──────────────────────────────────────────────────────────
+// ─── TOP BAR UPDATE ─────────────────────────────────────────────────────
 function updateTopBar() {
   const user   = getUser(USER_ID) || {};
   const status = running
@@ -206,16 +234,16 @@ function updateTopBar() {
   const now    = new Date().toLocaleTimeString('en-US', { hour12: false });
   const pend   = pendingMsg ? `  {yellow-fg}\u23F3 ${pendingMsg}{/yellow-fg}` : '';
 
-  const logo = `{bold}{#58a6ff-fg}\u25C8 VOLUME BOT{/#58a6ff-fg}{/bold}  {gray-fg}\u2502{/gray-fg}  {white-fg}Uniswap V4 on Base{/white-fg}`;
+  const logo       = `{bold}{#58a6ff-fg}\u25C8 VOLUME BOT{/#58a6ff-fg}{/bold}  {gray-fg}\u2502{/gray-fg}  {white-fg}Uniswap V4 \u2022 Base Network{/white-fg}`;
   const statusLine = `  ${status}   ${next}   ${trades}${pend}   {gray-fg}${now}{/gray-fg}`;
 
   topBar.setContent(`${logo}\n\n${statusLine}`);
   screen.render();
 }
 
-// ─── PnL CALCULATION ─────────────────────────────────────────────────────────
+// ─── PnL CALCULATION ────────────────────────────────────────────────────
 function calculatePnL() {
-  const user = getUser(USER_ID) || {};
+  const user    = getUser(USER_ID) || {};
   const history = user.trade_history || [];
   let totalBuyUsd = 0, totalSellUsd = 0, totalGasEth = 0;
   for (const t of history) {
@@ -226,62 +254,54 @@ function calculatePnL() {
   return { totalBuyUsd, totalSellUsd, totalGasEth, net: totalSellUsd - totalBuyUsd };
 }
 
-// ─── INFO BOX UPDATE ─────────────────────────────────────────────────────────
+// ─── INFO BOX UPDATE (pool details + decimals) ─────────────────────────
 function updateInfo() {
   const user = getUser(USER_ID) || {};
-  const wallets = getWallets(USER_ID);
-  const walletInfo = wallets.length > 0
-    ? `{cyan-fg}${wallets.length} wallet${wallets.length > 1 ? 's' : ''} loaded{/cyan-fg}`
-    : '{red-fg}NO WALLETS \u2014 go to SETTINGS{/red-fg}';
-  const pnl = calculatePnL();
+  const wallet = user.wallet_address
+    ? `{cyan-fg}${user.wallet_address.slice(0,10)}...${user.wallet_address.slice(-6)}{/cyan-fg}`
+    : '{red-fg}NOT SET \u2014 use QUICK SETUP or SETTINGS{/red-fg}';
+  const poolKey  = poolKeyFromUser(user);
+  const decimals = user.token_decimals != null ? user.token_decimals : 18;
+  const pool = poolKey
+    ? `{green-fg}Fee: ${poolKey.fee} | Tick: ${poolKey.tickSpacing}${poolKey.hooks !== ethers.ZeroAddress ? ` | Hook: ${poolKey.hooks.slice(0,10)}...` : ''}{/green-fg}`
+    : '{yellow-fg}No pool \u2014 set a token address to auto-discover{/yellow-fg}';
+  const pnl      = calculatePnL();
   const pnlColor = pnl.net >= 0 ? 'green-fg' : 'red-fg';
+
   infoBox.setContent(
-    ` Wallets  : ${walletInfo}\n` +
-    ` Token    : {cyan-fg}${user.token_symbol || 'TOKEN'}{/cyan-fg}  {gray-fg}${(user.token_address||'').slice(0,12)}...{/gray-fg}\n` +
-    ` Amount   : {yellow-fg}$${user.min_amount_usd||0.10} \u2013 $${user.max_amount_usd||0.50}{/yellow-fg}\n` +
-    ` Interval : {yellow-fg}${user.min_interval_sec||20}s \u2013 ${user.max_interval_sec||60}s{/yellow-fg}\n` +
+    ` Wallet   : ${wallet}\n` +
+    ` Token    : {cyan-fg}${user.token_symbol || 'NOT SET'}{/cyan-fg}  {gray-fg}${user.token_address ? `${user.token_address.slice(0,12)}... (${decimals} dec)` : ''}{/gray-fg}\n` +
+    ` Pool     : ${pool}\n` +
+    ` Amount   : {yellow-fg}$${(user.min_amount_usd || 0.10).toFixed(2)} \u2013 $${(user.max_amount_usd || 0.50).toFixed(2)}{/yellow-fg}   Interval: {yellow-fg}${user.min_interval_sec || 20}s \u2013 ${user.max_interval_sec || 60}s{/yellow-fg}\n` +
     ` PnL      : {${pnlColor}}$${pnl.net.toFixed(2)}{/${pnlColor}}  {gray-fg}(Buy: $${pnl.totalBuyUsd.toFixed(2)} | Sell: $${pnl.totalSellUsd.toFixed(2)} | Gas: ${pnl.totalGasEth.toFixed(4)} ETH){/gray-fg}`
   );
   screen.render();
 }
 
-// ─── BALANCES ────────────────────────────────────────────────────────────────
+// ─── BALANCES (pass correct token decimals) ─────────────────────────────
 async function refreshBalances() {
   const user = getUser(USER_ID) || {};
-  const wallets = getWallets(USER_ID);
-  if (wallets.length === 0) {
-    balBox.setContent('{red-fg}  No wallets \u2014 go to SETTINGS to import{/red-fg}');
+  if (!user.wallet_address) {
+    balBox.setContent('{red-fg}  No wallet \u2014 use QUICK SETUP or SETTINGS to import{/red-fg}');
     screen.render();
     return;
   }
-  balBox.setContent(`{gray-fg}  Fetching balances for ${wallets.length} wallet${wallets.length > 1 ? 's' : ''}...{/gray-fg}`);
+  balBox.setContent('{gray-fg}  Fetching...{/gray-fg}');
   screen.render();
   try {
-    const results = await Promise.all(
-      wallets.map(w => trader.getBalances(w.address, user.token_address).catch(() => null))
-    );
-    let totalEth = 0, totalWeth = 0, totalToken = 0;
-    let sym = user.token_symbol || 'TOKEN';
-    let ethPrice = null, tokenPrice = null;
-    for (const bal of results) {
-      if (!bal) continue;
-      totalEth   += parseFloat(bal.eth)   || 0;
-      totalWeth  += parseFloat(bal.weth)  || 0;
-      totalToken += parseFloat(bal.token?.replace(/,/g, '')) || 0;
-      if (bal.tokenSymbol) sym = bal.tokenSymbol;
-      if (bal.ethUsd) ethPrice = parseFloat(bal.ethUsd) / (parseFloat(bal.eth) || 1);
-      if (bal.tokenUsd && parseFloat(bal.token?.replace(/,/g, '')) > 0)
-        tokenPrice = parseFloat(bal.tokenUsd) / parseFloat(bal.token.replace(/,/g, ''));
-    }
-    const ethUsd   = ethPrice   ? `{gray-fg}  ~$${(totalEth * ethPrice).toFixed(2)}{/gray-fg}` : '';
-    const wethUsd  = ethPrice && totalWeth > 0 ? `{gray-fg}  ~$${(totalWeth * ethPrice).toFixed(2)}{/gray-fg}` : '';
-    const tokUsd   = tokenPrice ? `{gray-fg}  ~$${(totalToken * tokenPrice).toFixed(4)}{/gray-fg}` : '';
-    let content =
-      ` {white-fg}ETH   {/white-fg}  {green-fg}{bold}${totalEth.toFixed(4)}{/bold}{/green-fg}${ethUsd}  {gray-fg}(${wallets.length} wallets){/gray-fg}\n`;
-    if (totalWeth > 0)
-      content += ` {white-fg}WETH  {/white-fg}  {yellow-fg}${totalWeth.toFixed(6)}{/yellow-fg}${wethUsd}\n`;
-    content +=
-      ` {white-fg}${sym.padEnd(6)}{/white-fg}  {cyan-fg}{bold}${totalToken > 0 ? totalToken.toLocaleString() : '0'}{/bold}{/cyan-fg}${tokUsd}`;
+    const decimals = user.token_decimals || 18;
+    const bal = await trader.getBalances(user.wallet_address, user.token_address, decimals);
+    const sym = bal.tokenSymbol || user.token_symbol || 'TOKEN';
+    const ethUsd  = bal.ethUsd   ? `{gray-fg}  ~$${bal.ethUsd}{/gray-fg}` : '';
+    const wethUsd = bal.wethUsd  ? `{gray-fg}  ~$${bal.wethUsd}{/gray-fg}` : '';
+    const tokUsd  = bal.tokenUsd ? `{gray-fg}  ~$${bal.tokenUsd}{/gray-fg}` : '';
+    let content = ` {white-fg}ETH   {/white-fg}  {green-fg}{bold}${bal.eth}{/bold}{/green-fg}${ethUsd}\n`;
+    if (bal.weth)
+      content += ` {white-fg}WETH  {/white-fg}  {yellow-fg}${bal.weth}{/yellow-fg}${wethUsd}\n`;
+    if (user.token_address)
+      content += ` {white-fg}${sym.padEnd(6)}{/white-fg}  {cyan-fg}{bold}${bal.token}{/bold}{/cyan-fg}${tokUsd}`;
+    else
+      content += ' {gray-fg}Set a token address to see balance{/gray-fg}';
     balBox.setContent(content);
   } catch (e) {
     balBox.setContent(`{red-fg}  Error: ${e.message.slice(0,60)}{/red-fg}`);
@@ -289,40 +309,40 @@ async function refreshBalances() {
   screen.render();
 }
 
-// ─── LOG ─────────────────────────────────────────────────────────────────────
+// ─── LOG ────────────────────────────────────────────────────────────────
 function addLog(msg) {
   const t = new Date().toLocaleTimeString('en-US', { hour12: false });
   logBox.log(`{gray-fg}${t}{/gray-fg}  ${msg}`);
   screen.render();
 }
 
-// ─── GAS DISPLAY HELPER ─────────────────────────────────────────────────────
+// ─── GAS DISPLAY HELPER ────────────────────────────────────────────────
 function formatGas(receipt) {
   try {
-    const gasUsed = receipt.gasUsed || 0n;
+    const gasUsed  = receipt.gasUsed || 0n;
     const gasPrice = receipt.gasPrice || receipt.effectiveGasPrice || 0n;
     return parseFloat(ethers.formatEther(gasUsed * gasPrice)).toFixed(6);
   } catch { return '?'; }
 }
 
-// ─── TRADE HISTORY HELPER ───────────────────────────────────────────────────
+// ─── TRADE HISTORY HELPER ──────────────────────────────────────────────
 function recordTrade(type, amountUsd, amountEth, receipt) {
-  const user = getUser(USER_ID) || {};
-  const history = (user.trade_history || []).slice(-99); // keep max 100
+  const user    = getUser(USER_ID) || {};
+  const history = (user.trade_history || []).slice(-99);
   history.push({
     type,
     amountUsd: amountUsd || 0,
     amountEth: amountEth || 0,
-    txHash: receipt.hash,
-    gasUsed: formatGas(receipt),
+    txHash:    receipt.hash,
+    gasUsed:   formatGas(receipt),
     timestamp: Date.now(),
   });
   updateUser(USER_ID, { trade_count: (user.trade_count || 0) + 1, trade_history: history });
 }
 
-// ─── COUNTDOWN ───────────────────────────────────────────────────────────────
+// ─── COUNTDOWN ──────────────────────────────────────────────────────────
 function startCountdown(seconds) {
-  nextTradeIn = seconds;
+  nextTradeIn        = seconds;
   totalCountdownSecs = seconds;
   if (countdownTimer) clearInterval(countdownTimer);
   countdownTimer = setInterval(() => {
@@ -332,51 +352,50 @@ function startCountdown(seconds) {
   }, 1000);
 }
 
-// ─── TRADING ─────────────────────────────────────────────────────────────────
+// ─── TRADING (uses correct token decimals) ──────────────────────────────
 async function runTrade() {
   if (!running) return;
-  const user    = getUser(USER_ID);
-  const wallets = getWallets(USER_ID);
-  const poolKey = poolKeyFromUser(user);
+  const user     = getUser(USER_ID);
+  const poolKey  = poolKeyFromUser(user);
+  const decimals = user.token_decimals || 18;
   if (!poolKey) { addLog('{red-fg}\u2717 Pool key not configured \u2014 go to SETTINGS \u2192 Set Token Address{/red-fg}'); stopBot(); return; }
-  if (wallets.length === 0) { addLog('{red-fg}\u2717 No wallets \u2014 go to SETTINGS{/red-fg}'); stopBot(); return; }
-  const wallet   = wallets[Math.floor(Math.random() * wallets.length)];
-  const shortAddr = wallet.address.slice(0,6) + '...' + wallet.address.slice(-4);
   const ethPrice = await getEthPrice().catch(() => 2000);
   const usdAmt   = randomBetween(user.min_amount_usd, user.max_amount_usd);
   const ethAmt   = usdAmt / ethPrice;
-  const pk       = decrypt(wallet.encrypted);
+  const pk       = decrypt(user.wallet_encrypted);
   const isBuy    = Math.random() > 0.3;
 
   try {
     if (isBuy) {
       pendingMsg = 'Buying...'; updateTopBar();
-      addLog(`{yellow-fg}\u25B2 BUY{/yellow-fg}   $${usdAmt.toFixed(2)}  (${ethAmt.toFixed(6)} ETH)  {gray-fg}[${shortAddr}]{/gray-fg}`);
-      const r = await trader.buyToken(pk, user.token_address, ethAmt, null, poolKey);
+      addLog(`{yellow-fg}\u25B2 BUY{/yellow-fg}   $${usdAmt.toFixed(2)}  (${ethAmt.toFixed(6)} ETH)`);
+      const r   = await trader.buyToken(pk, user.token_address, ethAmt, null, poolKey);
       const gas = formatGas(r);
       recordTrade('buy', usdAmt, ethAmt, r);
-      addLog(`{green-fg}\u2713 BUY OK{/green-fg}  #${user.trade_count + 1}  {gray-fg}Gas: ${gas} ETH  TX: ${r.hash.slice(0,18)}...{/gray-fg}`);
+      addLog(`{green-fg}\u2713 BUY OK{/green-fg}  #${(user.trade_count || 0) + 1}  {gray-fg}Gas: ${gas} ETH{/gray-fg}`);
+      addLog(`{gray-fg}  \u2514\u2500 ${BASESCAN}${r.hash}{/gray-fg}`);
     } else {
       const pct = Math.floor(randomBetween(5, 15));
       pendingMsg = 'Selling...'; updateTopBar();
-      addLog(`{magenta-fg}\u25BC SELL{/magenta-fg}  ${pct}% of ${user.token_symbol || 'TOKEN'}  {gray-fg}[${shortAddr}]{/gray-fg}`);
-      const r = await trader.sellToken(pk, user.token_address, pct, null, 18, poolKey);
+      addLog(`{magenta-fg}\u25BC SELL{/magenta-fg}  ${pct}% of ${user.token_symbol || 'TOKEN'}`);
+      const r   = await trader.sellToken(pk, user.token_address, pct, null, decimals, poolKey);
       const gas = formatGas(r);
       recordTrade('sell', 0, 0, r);
-      addLog(`{green-fg}\u2713 SELL OK{/green-fg} #${user.trade_count + 1}  {gray-fg}Gas: ${gas} ETH  TX: ${r.hash.slice(0,18)}...{/gray-fg}`);
+      addLog(`{green-fg}\u2713 SELL OK{/green-fg} #${(user.trade_count || 0) + 1}  {gray-fg}Gas: ${gas} ETH{/gray-fg}`);
+      addLog(`{gray-fg}  \u2514\u2500 ${BASESCAN}${r.hash}{/gray-fg}`);
     }
   } catch (e) {
-    const msg = (e.shortMessage || e.reason || e.message || '').slice(0, 60);
-    addLog(`{red-fg}\u2717 ERR{/red-fg}   ${msg}  {gray-fg}[${shortAddr}]{/gray-fg}`);
+    const msg = (e.shortMessage || e.reason || e.message || '').slice(0, 80);
+    addLog(`{red-fg}\u2717 TRADE FAILED{/red-fg}  ${msg}`);
   }
 
   pendingMsg = ''; updateTopBar();
-  updateInfo();
+  updateInfo(); rebuildMenu();
   await refreshBalances();
 
   if (running) {
     const delay = Math.floor(randomBetween(user.min_interval_sec, user.max_interval_sec));
-    addLog(`{gray-fg}\u23F1 WAIT  ${delay}s...{/gray-fg}`);
+    addLog(`{gray-fg}\u23F1 Next trade in ${delay}s...{/gray-fg}`);
     startCountdown(delay);
     tradeTimer = setTimeout(runTrade, delay * 1000);
   }
@@ -384,112 +403,226 @@ async function runTrade() {
 
 function startBot() {
   const user = getUser(USER_ID);
-  const wallets = getWallets(USER_ID);
-  if (wallets.length === 0) { addLog('{red-fg}\u2717 No wallets \u2014 go to SETTINGS{/red-fg}'); return; }
-  if (!poolKeyFromUser(user)) { addLog('{red-fg}\u2717 Pool key not set \u2014 go to SETTINGS \u2192 Set Token Address{/red-fg}'); return; }
+  if (!user?.wallet_encrypted) { addLog('{red-fg}\u2717 No wallet \u2014 import one first{/red-fg}'); return; }
+  if (!poolKeyFromUser(user))  { addLog('{red-fg}\u2717 No pool configured \u2014 set a token address first{/red-fg}'); return; }
   if (running) { addLog('{gray-fg}Already running{/gray-fg}'); return; }
   running = true;
   addLog('{green-fg}{bold}\u2500\u2500\u2500 BOT STARTED \u2500\u2500\u2500{/bold}{/green-fg}');
-  updateTopBar(); updateInfo();
+  updateTopBar(); updateInfo(); rebuildMenu();
   runTrade();
 }
 
 function stopBot() {
-  if (!running) { addLog('{gray-fg}Already stopped{/gray-fg}'); return; }
+  if (!running) return;
   running = false;
   pendingMsg = '';
-  if (tradeTimer) { clearTimeout(tradeTimer); tradeTimer = null; }
+  if (tradeTimer)    { clearTimeout(tradeTimer);    tradeTimer    = null; }
   if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
   nextTradeIn = 0;
   addLog('{red-fg}{bold}\u2500\u2500\u2500 BOT STOPPED \u2500\u2500\u2500{/bold}{/red-fg}');
-  updateTopBar(); updateInfo();
+  updateTopBar(); updateInfo(); rebuildMenu();
 }
 
 async function doBuy(usdAmt) {
   const user = getUser(USER_ID);
-  const wallets = getWallets(USER_ID);
-  if (wallets.length === 0) { addLog('{red-fg}\u2717 No wallets \u2014 go to SETTINGS{/red-fg}'); return; }
+  if (!user?.wallet_encrypted) { addLog('{red-fg}\u2717 No wallet \u2014 import one first{/red-fg}'); return; }
   const poolKey = poolKeyFromUser(user);
-  if (!poolKey) { addLog('{red-fg}\u2717 Pool key not set \u2014 go to SETTINGS \u2192 Set Token Address{/red-fg}'); return; }
-  const wallet   = wallets[Math.floor(Math.random() * wallets.length)];
-  const shortAddr = wallet.address.slice(0,6) + '...' + wallet.address.slice(-4);
+  if (!poolKey) { addLog('{red-fg}\u2717 No pool configured \u2014 set a token address first{/red-fg}'); return; }
   const ethPrice = await getEthPrice().catch(() => 2000);
   const ethAmt   = usdAmt / ethPrice;
   pendingMsg = 'Buying...'; updateTopBar();
-  addLog(`{yellow-fg}\u25B2 BUY{/yellow-fg}   $${usdAmt.toFixed(2)} (manual)  {gray-fg}[${shortAddr}]{/gray-fg}`);
+  addLog(`{yellow-fg}\u25B2 BUY{/yellow-fg}   $${usdAmt.toFixed(2)} (manual)`);
   try {
-    const r = await trader.buyToken(decrypt(wallet.encrypted), user.token_address, ethAmt, null, poolKey);
+    const r   = await trader.buyToken(decrypt(user.wallet_encrypted), user.token_address, ethAmt, null, poolKey);
     const gas = formatGas(r);
     recordTrade('buy', usdAmt, ethAmt, r);
-    addLog(`{green-fg}\u2713 BUY OK{/green-fg}  {gray-fg}Gas: ${gas} ETH  TX: ${r.hash.slice(0,18)}...{/gray-fg}`);
+    addLog(`{green-fg}\u2713 BUY OK{/green-fg}  {gray-fg}Gas: ${gas} ETH{/gray-fg}`);
+    addLog(`{gray-fg}  \u2514\u2500 ${BASESCAN}${r.hash}{/gray-fg}`);
     await refreshBalances();
-  } catch (e) { addLog(`{red-fg}\u2717 ERR{/red-fg}   ${(e.shortMessage || e.reason || e.message || '').slice(0, 60)}`); }
-  pendingMsg = ''; updateTopBar(); updateInfo();
+  } catch (e) { addLog(`{red-fg}\u2717 BUY FAILED{/red-fg}  ${(e.shortMessage || e.reason || e.message || '').slice(0, 80)}`); }
+  pendingMsg = ''; updateTopBar(); updateInfo(); rebuildMenu();
 }
 
 async function doSell(pct) {
   const wasRunning = running;
   if (running) stopBot();
   const user = getUser(USER_ID);
-  const wallets = getWallets(USER_ID);
-  if (wallets.length === 0) { addLog('{red-fg}\u2717 No wallets \u2014 go to SETTINGS{/red-fg}'); return; }
+  if (!user?.wallet_encrypted) { addLog('{red-fg}\u2717 No wallet \u2014 import one first{/red-fg}'); return; }
   const poolKey = poolKeyFromUser(user);
-  if (!poolKey) { addLog('{red-fg}\u2717 Pool key not set \u2014 go to SETTINGS \u2192 Set Token Address{/red-fg}'); if (wasRunning) startBot(); return; }
+  if (!poolKey) { addLog('{red-fg}\u2717 No pool configured \u2014 set a token address first{/red-fg}'); if (wasRunning) startBot(); return; }
+  const decimals = user.token_decimals || 18;
   pendingMsg = 'Selling...'; updateTopBar();
-  // Sell from ALL wallets that hold tokens
-  let sold = 0;
-  for (const wallet of wallets) {
-    const shortAddr = wallet.address.slice(0,6) + '...' + wallet.address.slice(-4);
-    try {
-      addLog(`{magenta-fg}\u25BC SELL{/magenta-fg}  ${pct}% (manual)  {gray-fg}[${shortAddr}]{/gray-fg}`);
-      const r = await trader.sellToken(decrypt(wallet.encrypted), user.token_address, pct, null, 18, poolKey);
-      const gas = formatGas(r);
-      recordTrade('sell', 0, 0, r);
-      addLog(`{green-fg}\u2713 SELL OK{/green-fg} {gray-fg}Gas: ${gas} ETH  TX: ${r.hash.slice(0,18)}...{/gray-fg}`);
-      sold++;
-    } catch (e) {
-      const msg = (e.shortMessage || e.reason || e.message || '').slice(0, 60);
-      if (!msg.includes('No tokens')) addLog(`{red-fg}\u2717 ERR{/red-fg}   ${msg}  {gray-fg}[${shortAddr}]{/gray-fg}`);
-    }
-  }
-  addLog(`{green-fg}Sold from ${sold}/${wallets.length} wallets{/green-fg}`);
-  await refreshBalances();
-  pendingMsg = ''; updateTopBar(); updateInfo();
+  addLog(`{magenta-fg}\u25BC SELL{/magenta-fg}  ${pct}% (manual)`);
+  try {
+    const r   = await trader.sellToken(decrypt(user.wallet_encrypted), user.token_address, pct, null, decimals, poolKey);
+    const gas = formatGas(r);
+    recordTrade('sell', 0, 0, r);
+    addLog(`{green-fg}\u2713 SELL OK{/green-fg}  {gray-fg}Gas: ${gas} ETH{/gray-fg}`);
+    addLog(`{gray-fg}  \u2514\u2500 ${BASESCAN}${r.hash}{/gray-fg}`);
+    await refreshBalances();
+  } catch (e) { addLog(`{red-fg}\u2717 SELL FAILED{/red-fg}  ${(e.shortMessage || e.reason || e.message || '').slice(0, 80)}`); }
+  pendingMsg = ''; updateTopBar(); updateInfo(); rebuildMenu();
   if (wasRunning) startBot();
 }
 
 async function doUnwrapWETH() {
-  const wallets = getWallets(USER_ID);
-  if (wallets.length === 0) { addLog('{red-fg}\u2717 No wallets \u2014 go to SETTINGS{/red-fg}'); return; }
+  const user = getUser(USER_ID);
+  if (!user?.wallet_encrypted) { addLog('{red-fg}\u2717 No wallet \u2014 import one first{/red-fg}'); return; }
   pendingMsg = 'Unwrapping WETH...'; updateTopBar();
-  addLog('{yellow-fg}\u{1F504} UNWRAP{/yellow-fg}  WETH \u2192 ETH (all wallets)');
-  let unwrapped = 0;
-  for (const w of wallets) {
-    try {
-      const pk = decrypt(w.encrypted);
-      const wallet = new ethers.Wallet(pk, new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org'));
-      await trader.unwrapWETH(wallet);
-      unwrapped++;
-    } catch (e) {
-      const msg = (e.shortMessage || e.reason || e.message || '').slice(0, 60);
-      if (msg) addLog(`{red-fg}\u2717 ERR{/red-fg}   ${msg}  {gray-fg}[${w.address.slice(0,6)}...]{/gray-fg}`);
-    }
-  }
-  addLog(`{green-fg}\u2713 UNWRAP done{/green-fg}  ${unwrapped} wallets processed`);
-  await refreshBalances();
+  addLog('{yellow-fg}\u{1F504} UNWRAP{/yellow-fg}  WETH \u2192 ETH');
+  try {
+    const pk     = decrypt(user.wallet_encrypted);
+    const wallet = new ethers.Wallet(pk, new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org'));
+    await trader.unwrapWETH(wallet);
+    addLog('{green-fg}\u2713 UNWRAP OK{/green-fg}  WETH converted to ETH');
+    await refreshBalances();
+  } catch (e) { addLog(`{red-fg}\u2717 UNWRAP FAILED{/red-fg}  ${(e.shortMessage || e.reason || e.message || '').slice(0, 80)}`); }
   pendingMsg = ''; updateTopBar();
 }
 
-// ─── BUY MENU ───────────────────────────────────────────────────────────────
+// ─── Prompt Helper (returns value or null on Esc) ───────────────────────
+function promptInput(label, opts = {}) {
+  return new Promise((resolve) => {
+    const inputBox = blessed.textbox({
+      top: 'center', left: 'center',
+      width: opts.width || 56, height: opts.height || 5,
+      label: `  ${label}  `,
+      tags: true, border: { type: 'line' },
+      style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
+      inputOnFocus: true,
+      censor: opts.censor || false,
+    });
+    screen.append(inputBox);
+    inputBox.focus();
+    screen.render();
+    inputBox.on('submit', (val) => { inputBox.destroy(); screen.render(); resolve(val ? val.trim() : ''); });
+    inputBox.key(['escape'], () => { inputBox.destroy(); screen.render(); resolve(null); });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  QUICK SETUP WIZARD
+// ═══════════════════════════════════════════════════════════════════════
+async function openWizard() {
+  const user = getUser(USER_ID) || {};
+
+  addLog('{cyan-fg}{bold}\u2500\u2500\u2500 QUICK SETUP \u2500\u2500\u2500{/bold}{/cyan-fg}');
+  addLog('{gray-fg}Follow the prompts to configure your bot step by step.{/gray-fg}');
+
+  // Step 1: Wallet
+  if (!user.wallet_encrypted) {
+    addLog('{cyan-fg}Step 1/4:{/cyan-fg} Import your wallet private key');
+    const pk = await promptInput('Private Key (hidden, press Enter):', { censor: true });
+    if (pk === null || pk === '') { addLog('{gray-fg}Setup cancelled.{/gray-fg}'); menuBox.focus(); return; }
+    try {
+      const w = new ethers.Wallet(pk);
+      updateUser(USER_ID, { wallet_encrypted: encrypt(pk), wallet_address: w.address });
+      const envPath = path.join(__dirname, '.env');
+      let envRaw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+      envRaw = envRaw.match(/^PRIVATE_KEY=/m)
+        ? envRaw.replace(/^PRIVATE_KEY=.*/m, `PRIVATE_KEY=${pk}`)
+        : envRaw + `\nPRIVATE_KEY=${pk}`;
+      fs.writeFileSync(envPath, envRaw);
+      addLog(`{green-fg}\u2713{/green-fg} Wallet imported: {cyan-fg}${w.address}{/cyan-fg}`);
+    } catch (e) {
+      addLog(`{red-fg}\u2717 Invalid private key \u2014 check the format and try again in SETTINGS{/red-fg}`);
+      menuBox.focus(); rebuildMenu(); return;
+    }
+  } else {
+    addLog(`{green-fg}\u2713{/green-fg} Wallet already loaded: {cyan-fg}${user.wallet_address}{/cyan-fg}`);
+  }
+
+  // Step 2: Token Address
+  addLog('{cyan-fg}Step 2/4:{/cyan-fg} Enter the token contract address');
+  const addr = await promptInput('Token address (0x...):', { width: 60 });
+  if (addr === null || addr === '') {
+    addLog('{gray-fg}Skipped \u2014 you can set the token later in SETTINGS.{/gray-fg}');
+    menuBox.focus(); rebuildMenu(); refreshBalances(); return;
+  }
+  if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) {
+    addLog('{red-fg}\u2717 Invalid address \u2014 must be 0x followed by 40 hex characters{/red-fg}');
+    menuBox.focus(); rebuildMenu(); refreshBalances(); return;
+  }
+
+  addLog('{gray-fg}\u23F3 Fetching token info...{/gray-fg}');
+  try {
+    const info = await trader.getTokenInfo(addr);
+    addLog(`{green-fg}\u2713{/green-fg} Token: {cyan-fg}${info.symbol}{/cyan-fg} (${info.decimals} decimals)`);
+    updateUser(USER_ID, { token_address: addr, token_symbol: info.symbol, token_decimals: info.decimals });
+
+    addLog('{gray-fg}\u23F3 Discovering V4 pool... (this may take a moment){/gray-fg}');
+    const poolKey = await trader.discoverPoolKey(addr);
+    if (poolKey) {
+      updateUser(USER_ID, { fee_tier: poolKey.fee, tick_spacing: poolKey.tickSpacing, hook_address: poolKey.hooks });
+      const hookInfo = poolKey.hooks !== ethers.ZeroAddress ? `  Hook: ${poolKey.hooks.slice(0,12)}...` : '';
+      addLog(`{green-fg}\u2713 Pool found!{/green-fg}  Fee: ${poolKey.fee}  Spacing: ${poolKey.tickSpacing}${hookInfo}`);
+    } else {
+      addLog('{yellow-fg}\u26A0 No V4 pool found \u2014 use SETTINGS \u2192 Set Pool Key (Manual){/yellow-fg}');
+    }
+  } catch (e) {
+    addLog(`{red-fg}\u2717 Error: ${(e.shortMessage || e.message || '').slice(0,60)}{/red-fg}`);
+    menuBox.focus(); rebuildMenu(); refreshBalances(); return;
+  }
+
+  // Step 3: Trade Amounts
+  addLog('{cyan-fg}Step 3/4:{/cyan-fg} Set trade amount range (USD per trade)');
+  const amtStr = await promptInput('Min and Max USD, e.g. 0.10 0.50:');
+  if (amtStr !== null && amtStr.length > 0) {
+    const parts = amtStr.split(/[\s,]+/);
+    const minA  = parseFloat(parts[0]);
+    const maxA  = parseFloat(parts[1] || parts[0]);
+    if (!isNaN(minA) && !isNaN(maxA) && minA > 0 && maxA >= minA) {
+      updateUser(USER_ID, { min_amount_usd: minA, max_amount_usd: maxA });
+      addLog(`{green-fg}\u2713{/green-fg} Amount range: {yellow-fg}$${minA.toFixed(2)} \u2013 $${maxA.toFixed(2)}{/yellow-fg}`);
+    } else {
+      addLog('{yellow-fg}\u26A0 Invalid range \u2014 keeping defaults ($0.10 \u2013 $0.50){/yellow-fg}');
+    }
+  } else {
+    addLog('{gray-fg}Keeping default: $0.10 \u2013 $0.50{/gray-fg}');
+  }
+
+  // Step 4: Trade Intervals
+  addLog('{cyan-fg}Step 4/4:{/cyan-fg} Set trade interval range (seconds between trades)');
+  const intStr = await promptInput('Min and Max seconds, e.g. 20 60:');
+  if (intStr !== null && intStr.length > 0) {
+    const parts = intStr.split(/[\s,]+/);
+    const minI  = parseInt(parts[0]);
+    const maxI  = parseInt(parts[1] || parts[0]);
+    if (!isNaN(minI) && !isNaN(maxI) && minI >= 5 && maxI >= minI) {
+      updateUser(USER_ID, { min_interval_sec: minI, max_interval_sec: maxI });
+      addLog(`{green-fg}\u2713{/green-fg} Interval range: {yellow-fg}${minI}s \u2013 ${maxI}s{/yellow-fg}`);
+    } else {
+      addLog('{yellow-fg}\u26A0 Invalid range (min 5s) \u2014 keeping defaults (20s \u2013 60s){/yellow-fg}');
+    }
+  } else {
+    addLog('{gray-fg}Keeping default: 20s \u2013 60s{/gray-fg}');
+  }
+
+  addLog('{green-fg}{bold}\u2500\u2500\u2500 SETUP COMPLETE \u2500\u2500\u2500{/bold}{/green-fg}');
+  const u2 = getUser(USER_ID);
+  if (poolKeyFromUser(u2)) {
+    addLog('{gray-fg}Select START BOT from the menu to begin trading.{/gray-fg}');
+  } else {
+    addLog('{gray-fg}Set a pool key in SETTINGS before starting the bot.{/gray-fg}');
+  }
+
+  updateInfo(); rebuildMenu(); menuBox.focus();
+  refreshBalances();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  BUY MENU
+// ═══════════════════════════════════════════════════════════════════════
 function openBuyMenu() {
   const user = getUser(USER_ID) || {};
+  const sym  = user.token_symbol || 'TOKEN';
   const minA = user.min_amount_usd || 0.10;
   const maxA = user.max_amount_usd || 0.50;
 
   const overlay = blessed.box({
-    top: 'center', left: 'center', width: 42, height: 14,
+    top: 'center', left: 'center', width: 46, height: 17,
     tags: true, border: { type: 'line' },
-    label: ' {bold}{yellow-fg} \u25B2 BUY TOKEN {/yellow-fg}{/bold} ',
+    label: ` {bold}{yellow-fg} \u25B2 BUY ${sym} {/yellow-fg}{/bold} `,
     style: { bg: C.bgAlt, border: { fg: C.focus } },
   });
 
@@ -497,10 +630,7 @@ function openBuyMenu() {
     parent: overlay,
     top: 1, left: 1, right: 1, bottom: 3,
     tags: true,
-    style: {
-      bg: C.bgAlt, fg: C.text,
-      selected: { bg: C.accent, fg: 'white', bold: true },
-    },
+    style: { bg: C.bgAlt, fg: C.text, selected: { bg: C.accent, fg: 'white', bold: true } },
     keys: true, mouse: true,
     items: [
       `  \u{1F3B2}  Random ($${minA.toFixed(2)} \u2013 $${maxA.toFixed(2)})`,
@@ -508,163 +638,8 @@ function openBuyMenu() {
       '  \u25CF  $1.00',
       '  \u25CF  $5.00',
       '  \u25CF  $10.00',
-      '  \u2190  Back',
-    ],
-  });
-
-  const hint = blessed.text({
-    parent: overlay,
-    bottom: 1, left: 2, right: 2,
-    tags: true, height: 1,
-    content: '{gray-fg}Enter: select   Esc: back{/gray-fg}',
-    style: { bg: C.bgAlt },
-  });
-
-  screen.append(overlay);
-  buyList.focus();
-  screen.render();
-
-  buyList.on('select', (item, idx) => {
-    if (idx === 5) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
-    if (idx === 0) {
-      overlay.destroy(); menuBox.focus(); screen.render();
-      doBuy(randomBetween(minA, maxA));
-      return;
-    }
-    if (idx >= 2 && idx <= 4) {
-      const amounts = [1, 5, 10];
-      overlay.destroy(); menuBox.focus(); screen.render();
-      doBuy(amounts[idx - 2]);
-      return;
-    }
-    // idx === 1: custom amount
-    const inputBox = blessed.textbox({
-      top: 'center', left: 'center', width: 44, height: 5,
-      label: '  Amount in USD (e.g. 2.50):  ',
-      tags: true, border: { type: 'line' },
-      style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
-      inputOnFocus: true,
-    });
-    screen.append(inputBox);
-    inputBox.focus();
-    screen.render();
-    inputBox.on('submit', (val) => {
-      inputBox.destroy();
-      const amt = parseFloat(val.trim());
-      if (isNaN(amt) || amt <= 0) { addLog('{red-fg}\u2717 Invalid amount{/red-fg}'); overlay.destroy(); menuBox.focus(); screen.render(); return; }
-      overlay.destroy(); menuBox.focus(); screen.render();
-      doBuy(amt);
-    });
-    inputBox.key(['escape'], () => { inputBox.destroy(); buyList.focus(); screen.render(); });
-  });
-
-  buyList.key(['escape', 'q'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
-}
-
-// ─── SELL MENU ──────────────────────────────────────────────────────────────
-function openSellMenu() {
-  const overlay = blessed.box({
-    top: 'center', left: 'center', width: 42, height: 14,
-    tags: true, border: { type: 'line' },
-    label: ' {bold}{magenta-fg} \u25BC SELL TOKEN {/magenta-fg}{/bold} ',
-    style: { bg: C.bgAlt, border: { fg: C.focus } },
-  });
-
-  const sellList = blessed.list({
-    parent: overlay,
-    top: 1, left: 1, right: 1, bottom: 3,
-    tags: true,
-    style: {
-      bg: C.bgAlt, fg: C.text,
-      selected: { bg: C.accent, fg: 'white', bold: true },
-    },
-    keys: true, mouse: true,
-    items: [
-      '  \u25CF  Sell 25%',
-      '  \u25CF  Sell 50%',
-      '  \u25CF  Sell 75%',
-      '  \u25CF  Sell 100%',
-      '  \u270E  Custom %',
-      '  \u{1F504}  Unwrap WETH \u2192 ETH',
-      '  \u2190  Back',
-    ],
-  });
-
-  const hint = blessed.text({
-    parent: overlay,
-    bottom: 1, left: 2, right: 2,
-    tags: true, height: 1,
-    content: '{gray-fg}Enter: select   Esc: back{/gray-fg}',
-    style: { bg: C.bgAlt },
-  });
-
-  screen.append(overlay);
-  sellList.focus();
-  screen.render();
-
-  sellList.on('select', (item, idx) => {
-    if (idx === 6) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
-    if (idx >= 0 && idx <= 3) {
-      const pcts = [25, 50, 75, 100];
-      overlay.destroy(); menuBox.focus(); screen.render();
-      doSell(pcts[idx]);
-      return;
-    }
-    // idx === 5: unwrap WETH
-    if (idx === 5) {
-      overlay.destroy(); menuBox.focus(); screen.render();
-      doUnwrapWETH();
-      return;
-    }
-    // idx === 4: custom %
-    const inputBox = blessed.textbox({
-      top: 'center', left: 'center', width: 44, height: 5,
-      label: '  Sell percentage (1-100):  ',
-      tags: true, border: { type: 'line' },
-      style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
-      inputOnFocus: true,
-    });
-    screen.append(inputBox);
-    inputBox.focus();
-    screen.render();
-    inputBox.on('submit', (val) => {
-      inputBox.destroy();
-      const pct = parseInt(val.trim());
-      if (isNaN(pct) || pct < 1 || pct > 100) { addLog('{red-fg}\u2717 Invalid percentage (1-100){/red-fg}'); overlay.destroy(); menuBox.focus(); screen.render(); return; }
-      overlay.destroy(); menuBox.focus(); screen.render();
-      doSell(pct);
-    });
-    inputBox.key(['escape'], () => { inputBox.destroy(); sellList.focus(); screen.render(); });
-  });
-
-  sellList.key(['escape', 'q'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
-}
-
-// ─── SETTINGS ────────────────────────────────────────────────────────────────
-// ─── WALLET MANAGEMENT SUBMENU ───────────────────────────────────────────────
-function openWalletManager() {
-  const wallets = getWallets(USER_ID);
-  const overlay = blessed.box({
-    top: 'center', left: 'center', width: 54, height: 16,
-    tags: true, border: { type: 'line' },
-    label: ` {bold}{cyan-fg} Wallets (${wallets.length}) {/cyan-fg}{/bold} `,
-    style: { bg: C.bgAlt, border: { fg: C.focus } },
-  });
-
-  const walletList = blessed.list({
-    parent: overlay,
-    top: 1, left: 1, right: 1, bottom: 3,
-    tags: true,
-    style: {
-      bg: C.bgAlt, fg: C.text,
-      selected: { bg: '#1f6feb', fg: 'white', bold: true },
-    },
-    keys: true, mouse: true,
-    items: [
-      '  \u{1F511}  Import Single Wallet',
-      '  \u{1F4C4}  Bulk Import from wallets.txt',
-      `  \u{1F441}  View Wallets (${wallets.length} loaded)`,
-      '  \u{1F5D1}  Clear All Wallets',
+      '  \u25CF  $25.00',
+      '  \u25CF  $50.00',
       '  \u2190  Back',
     ],
   });
@@ -676,125 +651,186 @@ function openWalletManager() {
   });
 
   screen.append(overlay);
-  walletList.focus();
+  buyList.focus();
   screen.render();
 
-  walletList.on('select', (item, idx) => {
-    // Back
-    if (idx === 4) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
-
-    // Import Single Wallet
+  buyList.on('select', async (item, idx) => {
+    if (idx === 7) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
     if (idx === 0) {
-      const inputBox = blessed.textbox({
-        top: 'center', left: 'center', width: 54, height: 5,
-        label: '  Private Key (hidden):  ',
-        tags: true, border: { type: 'line' },
-        style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
-        inputOnFocus: true, censor: true,
-      });
-      screen.append(inputBox);
-      inputBox.focus();
-      screen.render();
-      inputBox.on('submit', (val) => {
-        inputBox.destroy();
-        const v = val.trim();
-        try {
-          const w = new ethers.Wallet(v);
-          const current = getWallets(USER_ID);
-          if (current.some(x => x.address.toLowerCase() === w.address.toLowerCase())) {
-            addLog('{yellow-fg}\u26A0 Wallet already imported{/yellow-fg}');
-          } else {
-            current.push({ encrypted: encrypt(v), address: w.address });
-            updateUser(USER_ID, { wallets: current, wallet_encrypted: current[0].encrypted, wallet_address: current[0].address });
-            addLog(`{green-fg}\u2713{/green-fg} Wallet added: {cyan-fg}${w.address.slice(0,10)}...{/cyan-fg}  (${current.length} total)`);
-          }
-        } catch (e) { addLog(`{red-fg}\u2717 Invalid key: ${(e.message || '').slice(0,40)}{/red-fg}`); }
-        updateInfo(); refreshBalances();
-        overlay.destroy(); menuBox.focus(); screen.render();
-      });
-      inputBox.key(['escape'], () => { inputBox.destroy(); walletList.focus(); screen.render(); });
-      return;
-    }
-
-    // Bulk Import from wallets.txt
-    if (idx === 1) {
-      const filePath = path.join(__dirname, 'wallets.txt');
-      if (!fs.existsSync(filePath)) {
-        addLog('{red-fg}\u2717 wallets.txt not found{/red-fg}  Create it with one private key per line');
-        return;
-      }
-      const lines = fs.readFileSync(filePath, 'utf8').split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-      const current = getWallets(USER_ID);
-      let added = 0, skipped = 0, failed = 0;
-      for (const line of lines) {
-        try {
-          const w = new ethers.Wallet(line);
-          if (current.some(x => x.address.toLowerCase() === w.address.toLowerCase())) {
-            skipped++;
-          } else {
-            current.push({ encrypted: encrypt(line), address: w.address });
-            added++;
-          }
-        } catch { failed++; }
-      }
-      updateUser(USER_ID, { wallets: current, wallet_encrypted: current[0]?.encrypted || null, wallet_address: current[0]?.address || null });
-      addLog(`{green-fg}\u2713 Bulk import:{/green-fg} ${added} added, ${skipped} skipped (dup), ${failed} failed  {gray-fg}(${current.length} total){/gray-fg}`);
-      updateInfo(); refreshBalances();
       overlay.destroy(); menuBox.focus(); screen.render();
+      doBuy(randomBetween(minA, maxA));
+      return;
+    }
+    if (idx >= 2 && idx <= 6) {
+      const amounts = [1, 5, 10, 25, 50];
+      overlay.destroy(); menuBox.focus(); screen.render();
+      doBuy(amounts[idx - 2]);
+      return;
+    }
+    // Custom amount
+    overlay.destroy();
+    const val = await promptInput('Amount in USD (e.g. 2.50):');
+    menuBox.focus();
+    if (val === null || val === '') { screen.render(); return; }
+    const amt = parseFloat(val);
+    if (isNaN(amt) || amt <= 0) { addLog('{red-fg}\u2717 Invalid amount \u2014 enter a positive number{/red-fg}'); screen.render(); return; }
+    doBuy(amt);
+  });
+
+  buyList.key(['escape'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  SELL MENU (confirmation for 100%)
+// ═══════════════════════════════════════════════════════════════════════
+function openSellMenu() {
+  const user = getUser(USER_ID) || {};
+  const sym  = user.token_symbol || 'TOKEN';
+
+  const overlay = blessed.box({
+    top: 'center', left: 'center', width: 46, height: 16,
+    tags: true, border: { type: 'line' },
+    label: ` {bold}{magenta-fg} \u25BC SELL ${sym} {/magenta-fg}{/bold} `,
+    style: { bg: C.bgAlt, border: { fg: C.focus } },
+  });
+
+  const sellList = blessed.list({
+    parent: overlay,
+    top: 1, left: 1, right: 1, bottom: 3,
+    tags: true,
+    style: { bg: C.bgAlt, fg: C.text, selected: { bg: C.accent, fg: 'white', bold: true } },
+    keys: true, mouse: true,
+    items: [
+      '  \u25CF  Sell 25%',
+      '  \u25CF  Sell 50%',
+      '  \u25CF  Sell 75%',
+      '  \u25CF  Sell 100% (all)',
+      '  \u270E  Custom %',
+      '  \u{1F504}  Unwrap WETH \u2192 ETH',
+      '  \u2190  Back',
+    ],
+  });
+
+  blessed.text({
+    parent: overlay, bottom: 1, left: 2, right: 2, height: 1, tags: true,
+    content: '{gray-fg}Enter: select   Esc: back{/gray-fg}',
+    style: { bg: C.bgAlt },
+  });
+
+  screen.append(overlay);
+  sellList.focus();
+  screen.render();
+
+  sellList.on('select', async (item, idx) => {
+    if (idx === 6) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
+
+    // 25%, 50%, 75%
+    if (idx >= 0 && idx <= 2) {
+      const pcts = [25, 50, 75];
+      overlay.destroy(); menuBox.focus(); screen.render();
+      doSell(pcts[idx]);
       return;
     }
 
-    // View Wallets
-    if (idx === 2) {
-      const current = getWallets(USER_ID);
-      if (current.length === 0) {
-        addLog('{yellow-fg}No wallets imported yet{/yellow-fg}');
-        return;
-      }
-      const viewOverlay = blessed.box({
-        top: 'center', left: 'center', width: 56, height: Math.min(current.length + 6, 30),
-        tags: true, border: { type: 'line' },
-        label: ` {bold}{cyan-fg} ${current.length} Wallets {/cyan-fg}{/bold} `,
-        style: { bg: C.bgAlt, border: { fg: C.focus } },
-      });
-      const viewLog = blessed.log({
-        parent: viewOverlay,
-        top: 1, left: 1, right: 1, bottom: 3,
-        tags: true, scrollable: true, mouse: true,
-        style: { bg: C.bgAlt, fg: C.text },
-      });
-      for (let i = 0; i < current.length; i++) {
-        viewLog.log(`{gray-fg}#${(i+1).toString().padStart(2)}{/gray-fg}  {cyan-fg}${current[i].address}{/cyan-fg}`);
-      }
-      blessed.text({
-        parent: viewOverlay, bottom: 1, left: 2, right: 2, height: 1, tags: true,
-        content: '{gray-fg}Esc: close{/gray-fg}',
-        style: { bg: C.bgAlt },
-      });
-      screen.append(viewOverlay);
-      viewOverlay.focus();
-      screen.render();
-      viewOverlay.key(['escape', 'q', 'enter'], () => { viewOverlay.destroy(); walletList.focus(); screen.render(); });
-      return;
-    }
-
-    // Clear All Wallets
+    // 100% sell — requires confirmation
     if (idx === 3) {
-      updateUser(USER_ID, { wallets: [], wallet_encrypted: null, wallet_address: null });
-      addLog('{yellow-fg}\u2717 All wallets cleared{/yellow-fg}');
-      updateInfo(); refreshBalances();
+      overlay.destroy();
+      const confirm = await promptInput(`Type YES to sell 100% of ${sym}:`);
+      menuBox.focus();
+      if (confirm !== null && confirm.toUpperCase() === 'YES') {
+        doSell(100);
+      } else {
+        addLog('{gray-fg}100% sell cancelled.{/gray-fg}');
+      }
+      screen.render();
+      return;
+    }
+
+    // Custom %
+    if (idx === 4) {
+      overlay.destroy();
+      const val = await promptInput('Sell percentage (1\u2013100):');
+      menuBox.focus();
+      if (val === null || val === '') { screen.render(); return; }
+      const pct = parseInt(val);
+      if (isNaN(pct) || pct < 1 || pct > 100) { addLog('{red-fg}\u2717 Invalid percentage (must be 1\u2013100){/red-fg}'); screen.render(); return; }
+      if (pct === 100) {
+        const confirm = await promptInput(`Type YES to sell 100% of ${sym}:`);
+        if (confirm === null || confirm.toUpperCase() !== 'YES') {
+          addLog('{gray-fg}100% sell cancelled.{/gray-fg}'); screen.render(); return;
+        }
+      }
+      doSell(pct);
+      return;
+    }
+
+    // Unwrap WETH
+    if (idx === 5) {
       overlay.destroy(); menuBox.focus(); screen.render();
+      doUnwrapWETH();
       return;
     }
   });
 
-  walletList.key(['escape', 'q'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
+  sellList.key(['escape'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
 }
 
-function openSettings() {
-  const wallets = getWallets(USER_ID);
+// ═══════════════════════════════════════════════════════════════════════
+//  TRADE HISTORY VIEWER
+// ═══════════════════════════════════════════════════════════════════════
+function openTradeHistory() {
+  const user    = getUser(USER_ID) || {};
+  const history = (user.trade_history || []).slice(-20).reverse();
+
   const overlay = blessed.box({
-    top: 'center', left: 'center', width: 54, height: 16,
+    top: 'center', left: 'center', width: 72, height: 24,
+    tags: true, border: { type: 'line' },
+    label: ' {bold}{cyan-fg} TRADE HISTORY (last 20) {/cyan-fg}{/bold} ',
+    style: { bg: C.bgAlt, border: { fg: C.focus } },
+    padding: { left: 1, top: 1 },
+    scrollable: true, alwaysScroll: true, mouse: true, keys: true,
+  });
+
+  if (history.length === 0) {
+    overlay.setContent('{gray-fg}No trades yet.{/gray-fg}\n\n{gray-fg}Press Esc to close{/gray-fg}');
+  } else {
+    let content = '{bold}{gray-fg}  #   Type   Amount        Gas ETH        Time{/gray-fg}{/bold}\n';
+    content += ' {gray-fg}' + '\u2500'.repeat(66) + '{/gray-fg}\n';
+    for (let i = 0; i < history.length; i++) {
+      const t    = history[i];
+      const num  = String(history.length - i).padStart(3);
+      const type = t.type === 'buy' ? '{yellow-fg}BUY {/yellow-fg}' : '{magenta-fg}SELL{/magenta-fg}';
+      const amt  = t.amountUsd > 0 ? `$${t.amountUsd.toFixed(2).padStart(7)}` : '       \u2014';
+      const gas  = `${(t.gasUsed || '?').toString().padStart(10)}`;
+      const time = new Date(t.timestamp).toLocaleString('en-US', {
+        month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+      });
+      content += `  ${num}   ${type}   ${amt}   {gray-fg}${gas}{/gray-fg}     {gray-fg}${time}{/gray-fg}\n`;
+    }
+    content += '\n {gray-fg}Press Esc to close{/gray-fg}';
+    overlay.setContent(content);
+  }
+
+  screen.append(overlay);
+  overlay.focus();
+  screen.render();
+
+  overlay.key(['escape', 'enter'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  SETTINGS (combined flows, current values, view wallet, reset PnL)
+// ═══════════════════════════════════════════════════════════════════════
+function openSettings() {
+  const user       = getUser(USER_ID) || {};
+  const walletHint = user.wallet_address ? `${user.wallet_address.slice(0,8)}...${user.wallet_address.slice(-4)}` : 'not set';
+  const tokenHint  = user.token_symbol && user.token_address ? user.token_symbol : 'not set';
+  const poolHint   = user.fee_tier != null ? `Fee:${user.fee_tier} Tick:${user.tick_spacing}` : 'not set';
+  const amtHint    = `$${(user.min_amount_usd || 0.10).toFixed(2)}\u2013$${(user.max_amount_usd || 0.50).toFixed(2)}`;
+  const intHint    = `${user.min_interval_sec || 20}s\u2013${user.max_interval_sec || 60}s`;
+
+  const overlay = blessed.box({
+    top: 'center', left: 'center', width: 60, height: 18,
     tags: true, border: { type: 'line' },
     label: ' {bold}{magenta-fg} \u2699 SETTINGS {/magenta-fg}{/bold} ',
     style: { bg: C.bgAlt, border: { fg: C.focus } },
@@ -804,19 +840,16 @@ function openSettings() {
     parent: overlay,
     top: 1, left: 1, right: 1, bottom: 3,
     tags: true,
-    style: {
-      bg: C.bgAlt, fg: C.text,
-      selected: { bg: '#1f6feb', fg: 'white', bold: true },
-    },
+    style: { bg: C.bgAlt, fg: C.text, selected: { bg: '#1f6feb', fg: 'white', bold: true } },
     keys: true, mouse: true,
     items: [
-      `  \u{1F4B0}  Manage Wallets (${wallets.length} loaded)`,
-      '  \u{1F4B0}  Set Token Address',
-      '  \u{1F527}  Set Pool Key (Manual)',
-      '  \u25CF  Set Min Trade Amount (USD)',
-      '  \u25CF  Set Max Trade Amount (USD)',
-      '  \u25CF  Set Min Interval (seconds)',
-      '  \u25CF  Set Max Interval (seconds)',
+      `  \u{1F511}  Wallet             {gray-fg}${walletHint}{/gray-fg}`,
+      `  \u{1F4B0}  Token Address       {gray-fg}${tokenHint}{/gray-fg}`,
+      `  \u{1F527}  Pool Key (Manual)   {gray-fg}${poolHint}{/gray-fg}`,
+      `  \u{1F4B5}  Trade Amounts       {gray-fg}${amtHint}{/gray-fg}`,
+      `  \u23F1   Trade Intervals     {gray-fg}${intHint}{/gray-fg}`,
+      '  \u{1F441}   View Wallet Address',
+      '  \u{1F504}  Reset PnL & History',
       '  \u2190  Back',
     ],
   });
@@ -831,175 +864,208 @@ function openSettings() {
   settingsList.focus();
   screen.render();
 
-  settingsList.on('select', (item, idx) => {
-    // Back
+  settingsList.on('select', async (item, idx) => {
     if (idx === 7) { overlay.destroy(); menuBox.focus(); screen.render(); return; }
 
-    // Manage Wallets
+    // ── Wallet Import ──
     if (idx === 0) {
-      overlay.destroy(); menuBox.focus(); screen.render();
-      openWalletManager();
-      return;
-    }
-
-    // Token Address
-    if (idx === 1) {
-      const inputBox = blessed.textbox({
-        top: 'center', left: 'center', width: 56, height: 5,
-        label: '  Token contract address (0x...):  ',
-        tags: true, border: { type: 'line' },
-        style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
-        inputOnFocus: true,
-      });
-      screen.append(inputBox);
-      inputBox.focus();
-      screen.render();
-
-      inputBox.on('submit', async (val) => {
-        inputBox.destroy();
-        screen.render();
-        const addr = val.trim();
-        if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) {
-          addLog('{red-fg}\u2717 Invalid address format{/red-fg}');
-          settingsList.focus(); screen.render();
-          return;
-        }
-        addLog('{gray-fg}\u23F3 Fetching token info...{/gray-fg}');
-        try {
-          const info = await trader.getTokenInfo(addr);
-          addLog(`{green-fg}\u2713{/green-fg} Token: {cyan-fg}${info.symbol}{/cyan-fg} (${info.decimals} decimals)`);
-          updateUser(USER_ID, { token_address: addr, token_symbol: info.symbol, token_decimals: info.decimals });
-
-          addLog('{gray-fg}\u23F3 Discovering V4 pool... (may take a moment){/gray-fg}');
-          const poolKey = await trader.discoverPoolKey(addr);
-          if (poolKey) {
-            updateUser(USER_ID, { fee_tier: poolKey.fee, tick_spacing: poolKey.tickSpacing, hook_address: poolKey.hooks });
-            addLog(`{green-fg}\u2713 Pool found!{/green-fg}  Fee: ${poolKey.fee}  Spacing: ${poolKey.tickSpacing}`);
-          } else {
-            addLog('{yellow-fg}\u26A0 No V4 pool found \u2014 use SETTINGS \u2192 Set Pool Key (Manual){/yellow-fg}');
-          }
-        } catch (e) {
-          addLog(`{red-fg}\u2717 Error: ${(e.shortMessage || e.message || '').slice(0,60)}{/red-fg}`);
-        }
-        updateInfo(); refreshBalances();
-        overlay.destroy(); menuBox.focus(); screen.render();
-      });
-
-      inputBox.key(['escape'], () => { inputBox.destroy(); settingsList.focus(); screen.render(); });
-      return;
-    }
-
-    // Pool Key (Manual)
-    if (idx === 2) {
-      const inputBox = blessed.textbox({
-        top: 'center', left: 'center', width: 58, height: 5,
-        label: '  fee tickSpacing [hooks] (e.g. 3000 60):  ',
-        tags: true, border: { type: 'line' },
-        style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
-        inputOnFocus: true,
-      });
-      screen.append(inputBox);
-      inputBox.focus();
-      screen.render();
-
-      inputBox.on('submit', (val) => {
-        inputBox.destroy();
-        const parts = val.trim().split(/\s+/);
-        const fee = parseInt(parts[0]);
-        const tickSpacing = parseInt(parts[1]);
-        const hooks = parts[2] || '0x0000000000000000000000000000000000000000';
-        if (isNaN(fee) || isNaN(tickSpacing)) {
-          addLog('{red-fg}\u2717 Invalid format. Use: fee tickSpacing [hooks]{/red-fg}');
-          settingsList.focus(); screen.render();
-          return;
-        }
-        if (hooks !== '0x0000000000000000000000000000000000000000' && !/^0x[0-9a-fA-F]{40}$/.test(hooks)) {
-          addLog('{red-fg}\u2717 Invalid hooks address{/red-fg}');
-          settingsList.focus(); screen.render();
-          return;
-        }
-        updateUser(USER_ID, { fee_tier: fee, tick_spacing: tickSpacing, hook_address: hooks });
-        addLog(`{green-fg}\u2713{/green-fg} Pool key set: Fee=${fee} Spacing=${tickSpacing} Hooks=${hooks.slice(0,10)}...`);
-        updateInfo();
-        overlay.destroy(); menuBox.focus(); screen.render();
-      });
-
-      inputBox.key(['escape'], () => { inputBox.destroy(); settingsList.focus(); screen.render(); });
-      return;
-    }
-
-    // Numeric settings (idx 3-6)
-    const labels = [
-      '', '', '', // wallet, token, pool handled above
-      'Min Amount USD (e.g. 0.10):',
-      'Max Amount USD (e.g. 0.50):',
-      'Min Interval sec (e.g. 10):',
-      'Max Interval sec (e.g. 30):',
-    ];
-
-    const inputBox = blessed.textbox({
-      top: 'center', left: 'center', width: 54, height: 5,
-      label: `  ${labels[idx]}  `,
-      tags: true, border: { type: 'line' },
-      style: { bg: C.bg, border: { fg: C.focus }, fg: 'white' },
-      inputOnFocus: true,
-    });
-
-    screen.append(inputBox);
-    inputBox.focus();
-    screen.render();
-
-    inputBox.on('submit', (val) => {
-      inputBox.destroy();
-      const v = val.trim();
+      overlay.destroy();
+      const pk = await promptInput('Private Key (hidden):', { censor: true });
+      menuBox.focus();
+      if (pk === null || pk === '') { screen.render(); return; }
       try {
-        if (idx === 3) { updateUser(USER_ID, { min_amount_usd: parseFloat(v) }); addLog(`{green-fg}\u2713{/green-fg} Min amount: $${v}`); }
-        else if (idx === 4) { updateUser(USER_ID, { max_amount_usd: parseFloat(v) }); addLog(`{green-fg}\u2713{/green-fg} Max amount: $${v}`); }
-        else if (idx === 5) { updateUser(USER_ID, { min_interval_sec: parseInt(v) }); addLog(`{green-fg}\u2713{/green-fg} Min interval: ${v}s`); }
-        else if (idx === 6) { updateUser(USER_ID, { max_interval_sec: parseInt(v) }); addLog(`{green-fg}\u2713{/green-fg} Max interval: ${v}s`); }
+        const w = new ethers.Wallet(pk);
+        updateUser(USER_ID, { wallet_encrypted: encrypt(pk), wallet_address: w.address });
+        const envPath = path.join(__dirname, '.env');
+        let envRaw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+        envRaw = envRaw.match(/^PRIVATE_KEY=/m)
+          ? envRaw.replace(/^PRIVATE_KEY=.*/m, `PRIVATE_KEY=${pk}`)
+          : envRaw + `\nPRIVATE_KEY=${pk}`;
+        fs.writeFileSync(envPath, envRaw);
+        addLog(`{green-fg}\u2713{/green-fg} Wallet: {cyan-fg}${w.address}{/cyan-fg}`);
       } catch (e) { addLog(`{red-fg}\u2717 ${(e.shortMessage || e.message || '').slice(0,60)}{/red-fg}`); }
-      updateInfo(); refreshBalances();
-      overlay.destroy(); menuBox.focus(); screen.render();
-    });
+      updateInfo(); refreshBalances(); rebuildMenu(); screen.render();
+      return;
+    }
 
-    inputBox.key(['escape'], () => { inputBox.destroy(); settingsList.focus(); screen.render(); });
+    // ── Token Address ──
+    if (idx === 1) {
+      overlay.destroy();
+      const addr = await promptInput('Token contract address (0x...):', { width: 60 });
+      menuBox.focus();
+      if (addr === null || addr === '') { screen.render(); return; }
+      if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) {
+        addLog('{red-fg}\u2717 Invalid address \u2014 must be 0x followed by 40 hex characters{/red-fg}');
+        screen.render(); return;
+      }
+      addLog('{gray-fg}\u23F3 Fetching token info...{/gray-fg}');
+      try {
+        const info = await trader.getTokenInfo(addr);
+        addLog(`{green-fg}\u2713{/green-fg} Token: {cyan-fg}${info.symbol}{/cyan-fg} (${info.decimals} decimals)`);
+        updateUser(USER_ID, { token_address: addr, token_symbol: info.symbol, token_decimals: info.decimals });
+
+        addLog('{gray-fg}\u23F3 Discovering V4 pool... (may take a moment){/gray-fg}');
+        const poolKey = await trader.discoverPoolKey(addr);
+        if (poolKey) {
+          updateUser(USER_ID, { fee_tier: poolKey.fee, tick_spacing: poolKey.tickSpacing, hook_address: poolKey.hooks });
+          const hookInfo = poolKey.hooks !== ethers.ZeroAddress ? `  Hook: ${poolKey.hooks.slice(0,12)}...` : '';
+          addLog(`{green-fg}\u2713 Pool found!{/green-fg}  Fee: ${poolKey.fee}  Spacing: ${poolKey.tickSpacing}${hookInfo}`);
+        } else {
+          addLog('{yellow-fg}\u26A0 No V4 pool found \u2014 use Set Pool Key (Manual){/yellow-fg}');
+        }
+      } catch (e) {
+        addLog(`{red-fg}\u2717 Error: ${(e.shortMessage || e.message || '').slice(0,60)}{/red-fg}`);
+      }
+      updateInfo(); refreshBalances(); rebuildMenu(); screen.render();
+      return;
+    }
+
+    // ── Pool Key (Manual) ──
+    if (idx === 2) {
+      overlay.destroy();
+      const val = await promptInput('fee tickSpacing [hooks]  e.g. 3000 60:', { width: 62 });
+      menuBox.focus();
+      if (val === null || val === '') { screen.render(); return; }
+      const parts       = val.split(/\s+/);
+      const fee         = parseInt(parts[0]);
+      const tickSpacing = parseInt(parts[1]);
+      const hooks       = parts[2] || '0x0000000000000000000000000000000000000000';
+      if (isNaN(fee) || isNaN(tickSpacing)) {
+        addLog('{red-fg}\u2717 Invalid format \u2014 use: fee tickSpacing [hooks]{/red-fg}');
+        screen.render(); return;
+      }
+      if (hooks !== '0x0000000000000000000000000000000000000000' && !/^0x[0-9a-fA-F]{40}$/.test(hooks)) {
+        addLog('{red-fg}\u2717 Invalid hooks address{/red-fg}');
+        screen.render(); return;
+      }
+      updateUser(USER_ID, { fee_tier: fee, tick_spacing: tickSpacing, hook_address: hooks });
+      const hookInfo = hooks !== '0x0000000000000000000000000000000000000000' ? ` Hooks=${hooks.slice(0,12)}...` : '';
+      addLog(`{green-fg}\u2713{/green-fg} Pool key set: Fee=${fee} Spacing=${tickSpacing}${hookInfo}`);
+      updateInfo(); rebuildMenu(); screen.render();
+      return;
+    }
+
+    // ── Trade Amounts (combined min + max) ──
+    if (idx === 3) {
+      overlay.destroy();
+      const val = await promptInput('Min and Max USD (e.g. 0.10 0.50):');
+      menuBox.focus();
+      if (val === null || val === '') { screen.render(); return; }
+      const parts = val.split(/[\s,]+/);
+      const minA  = parseFloat(parts[0]);
+      const maxA  = parseFloat(parts[1] || parts[0]);
+      if (isNaN(minA) || isNaN(maxA) || minA <= 0 || maxA < minA) {
+        addLog('{red-fg}\u2717 Invalid range \u2014 enter two positive numbers (min max){/red-fg}');
+        screen.render(); return;
+      }
+      updateUser(USER_ID, { min_amount_usd: minA, max_amount_usd: maxA });
+      addLog(`{green-fg}\u2713{/green-fg} Amount range: $${minA.toFixed(2)} \u2013 $${maxA.toFixed(2)}`);
+      updateInfo(); screen.render();
+      return;
+    }
+
+    // ── Trade Intervals (combined min + max) ──
+    if (idx === 4) {
+      overlay.destroy();
+      const val = await promptInput('Min and Max seconds (e.g. 20 60):');
+      menuBox.focus();
+      if (val === null || val === '') { screen.render(); return; }
+      const parts = val.split(/[\s,]+/);
+      const minI  = parseInt(parts[0]);
+      const maxI  = parseInt(parts[1] || parts[0]);
+      if (isNaN(minI) || isNaN(maxI) || minI < 5 || maxI < minI) {
+        addLog('{red-fg}\u2717 Invalid range \u2014 minimum 5 seconds, max must be \u2265 min{/red-fg}');
+        screen.render(); return;
+      }
+      updateUser(USER_ID, { min_interval_sec: minI, max_interval_sec: maxI });
+      addLog(`{green-fg}\u2713{/green-fg} Interval range: ${minI}s \u2013 ${maxI}s`);
+      updateInfo(); screen.render();
+      return;
+    }
+
+    // ── View Wallet Address ──
+    if (idx === 5) {
+      overlay.destroy();
+      const u = getUser(USER_ID) || {};
+      if (u.wallet_address) {
+        addLog(`{cyan-fg}Wallet: ${u.wallet_address}{/cyan-fg}`);
+        addLog('{gray-fg}Fund this address with ETH on Base to start trading{/gray-fg}');
+      } else {
+        addLog('{red-fg}No wallet imported yet{/red-fg}');
+      }
+      menuBox.focus(); screen.render();
+      return;
+    }
+
+    // ── Reset PnL & History ──
+    if (idx === 6) {
+      overlay.destroy();
+      const val = await promptInput('Type RESET to confirm:');
+      menuBox.focus();
+      if (val !== null && val.toUpperCase() === 'RESET') {
+        updateUser(USER_ID, { trade_count: 0, trade_history: [] });
+        addLog('{green-fg}\u2713 PnL and trade history cleared{/green-fg}');
+        updateInfo(); rebuildMenu();
+      } else {
+        addLog('{gray-fg}Reset cancelled.{/gray-fg}');
+      }
+      screen.render();
+      return;
+    }
   });
 
-  settingsList.key(['escape', 'q'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
+  settingsList.key(['escape'], () => { overlay.destroy(); menuBox.focus(); screen.render(); });
 }
 
-
+// ─── MENU HANDLER ───────────────────────────────────────────────────────
 menuBox.on('select', (item, idx) => {
-  const actions = [
-    () => startBot(),
-    () => stopBot(),
-    () => openBuyMenu(),
-    () => openSellMenu(),
-    () => openSettings(),
-    () => { stopBot(); screen.destroy(); process.exit(0); },
-  ];
-  if (actions[idx]) actions[idx]();
+  if (menuActions[idx]) menuActions[idx]();
 });
 
-// ─── GLOBAL KEYS ──────────────────────────────────────────────────────────────
+// ─── GLOBAL KEYS ────────────────────────────────────────────────────────
 screen.key(['r', 'R'], () => { addLog('{gray-fg}\u{1F504} Refreshing...{/gray-fg}'); refreshBalances(); });
 screen.key(['q', 'Q'], () => { stopBot(); screen.destroy(); process.exit(0); });
 screen.key('C-c',      () => { stopBot(); screen.destroy(); process.exit(0); });
 
-// ─── CLOCK + AUTO-REFRESH ───────────────────────────────────────────────────
+screen.key(['space'], () => {
+  const user = getUser(USER_ID);
+  if (!user?.wallet_encrypted || !poolKeyFromUser(user)) return;
+  if (running) stopBot(); else startBot();
+});
+
+screen.key(['b', 'B'], () => {
+  const user = getUser(USER_ID);
+  if (user?.wallet_encrypted) openBuyMenu();
+});
+screen.key(['s', 'S'], () => {
+  const user = getUser(USER_ID);
+  if (user?.wallet_encrypted) openSellMenu();
+});
+
+// ─── CLOCK + AUTO-REFRESH ───────────────────────────────────────────────
 setInterval(updateTopBar, 1000);
 setInterval(() => { if (!pendingMsg) refreshBalances(); }, 30000);
 
-// ─── INIT ─────────────────────────────────────────────────────────────────────
+// ─── INIT ───────────────────────────────────────────────────────────────
 const user0 = getUser(USER_ID);
-const wallets0 = getWallets(USER_ID);
-addLog(wallets0.length > 0
-  ? `{cyan-fg}\u{1F511} ${wallets0.length} wallet${wallets0.length > 1 ? 's' : ''} loaded{/cyan-fg}`
-  : '{yellow-fg}\u26A0 No wallets \u2014 go to SETTINGS to import{/yellow-fg}');
-addLog('{gray-fg}Navigate with \u2191/\u2193, press Enter to select.{/gray-fg}');
+rebuildMenu();
+
+if (user0?.wallet_address) {
+  addLog(`{cyan-fg}\u{1F511} Wallet loaded: ${user0.wallet_address.slice(0,10)}...${user0.wallet_address.slice(-6)}{/cyan-fg}`);
+} else {
+  addLog('{yellow-fg}\u26A0 No wallet \u2014 select QUICK SETUP to get started{/yellow-fg}');
+}
+
+if (!user0?.wallet_address || !user0?.token_address) {
+  addLog('{cyan-fg}Tip: Use QUICK SETUP to configure wallet, token, and trading params in one go.{/cyan-fg}');
+} else if (poolKeyFromUser(user0)) {
+  addLog('{gray-fg}Ready to trade. Press Space or select START BOT to begin.{/gray-fg}');
+} else {
+  addLog('{yellow-fg}Pool not configured \u2014 go to SETTINGS \u2192 Set Token Address{/yellow-fg}');
+}
+
+addLog('{gray-fg}Navigate with \u2191/\u2193, Enter to select. Press B/S for quick buy/sell.{/gray-fg}');
 updateTopBar();
 updateInfo();
 refreshBalances();
 screen.render();
-
-
