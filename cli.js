@@ -550,8 +550,8 @@ async function openWizard() {
     addLog(`{green-fg}\u2713{/green-fg} Token: {cyan-fg}${info.symbol}{/cyan-fg} (${info.decimals} decimals)`);
     updateUser(USER_ID, { token_address: addr, token_symbol: info.symbol, token_decimals: info.decimals });
 
-    addLog('{gray-fg}\u23F3 Discovering V4 pool... (this may take a moment){/gray-fg}');
-    const poolKey = await trader.discoverPoolKey(addr);
+    addLog('{gray-fg}\u23F3 Discovering V4 pool...{/gray-fg}');
+    const poolKey = await trader.discoverPoolKey(addr, (msg) => addLog(`{gray-fg}  \u2514 ${msg}{/gray-fg}`));
     if (poolKey) {
       updateUser(USER_ID, { fee_tier: poolKey.fee, tick_spacing: poolKey.tickSpacing, hook_address: poolKey.hooks });
       const hookInfo = poolKey.hooks !== ethers.ZeroAddress ? `  Hook: ${poolKey.hooks.slice(0,12)}...` : '';
@@ -904,8 +904,8 @@ function openSettings() {
         addLog(`{green-fg}\u2713{/green-fg} Token: {cyan-fg}${info.symbol}{/cyan-fg} (${info.decimals} decimals)`);
         updateUser(USER_ID, { token_address: addr, token_symbol: info.symbol, token_decimals: info.decimals });
 
-        addLog('{gray-fg}\u23F3 Discovering V4 pool... (may take a moment){/gray-fg}');
-        const poolKey = await trader.discoverPoolKey(addr);
+        addLog('{gray-fg}\u23F3 Discovering V4 pool...{/gray-fg}');
+        const poolKey = await trader.discoverPoolKey(addr, (msg) => addLog(`{gray-fg}  \u2514 ${msg}{/gray-fg}`));
         if (poolKey) {
           updateUser(USER_ID, { fee_tier: poolKey.fee, tick_spacing: poolKey.tickSpacing, hook_address: poolKey.hooks });
           const hookInfo = poolKey.hooks !== ethers.ZeroAddress ? `  Hook: ${poolKey.hooks.slice(0,12)}...` : '';

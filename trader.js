@@ -54,6 +54,26 @@ const ROUTER_ABI = [
 
 // ─── Pool Key Discovery (called once when token is set) ──────────────────────
 
+// Known hook contracts on Base — probed alongside standard no-hook pools
+const KNOWN_HOOKS = [
+  ethers.ZeroAddress,
+  '0xbB7784A4d481184283Ed89619A3e3ed143e1Adc0', // Clanker hook v1
+  '0x1E4a7e9e0244FbE2e3a5666e6F43E8E1eaEA4D00', // Clanker hook v2
+];
+
+// Common fee / tickSpacing configurations across Uniswap V4 on Base
+const PROBE_CONFIGS = [
+  { fee: 3000,    tickSpacing: 60  },   // 0.30% — most common
+  { fee: 10000,   tickSpacing: 200 },   // 1.00% — exotic / meme
+  { fee: 500,     tickSpacing: 10  },   // 0.05% — correlated pairs
+  { fee: 100,     tickSpacing: 1   },   // 0.01% — stablecoins
+  { fee: 8388608, tickSpacing: 200 },   // dynamic fee (0x800000) — Clanker
+  { fee: 8388608, tickSpacing: 60  },   // dynamic fee — alt spacing
+  { fee: 8388608, tickSpacing: 10  },   // dynamic fee — tight spacing
+  { fee: 10000,   tickSpacing: 100 },   // 1% alt spacing
+  { fee: 3000,    tickSpacing: 1   },   // 0.30% tight
+];
+
 async function probeCommonPools(tokenAddress) {
   const [c0, c1] = tokenAddress.toLowerCase() < WETH.toLowerCase()
     ? [tokenAddress, WETH]
@@ -63,42 +83,42 @@ async function probeCommonPools(tokenAddress) {
     'function getSlot0(bytes32) external view returns (uint160, int24, uint24, uint24)',
   ], provider);
   const coder = ethers.AbiCoder.defaultAbiCoder();
-  const hooks = ethers.ZeroAddress;
 
-  const CONFIGS = [
-    { fee: 500, tickSpacing: 10 },
-    { fee: 3000, tickSpacing: 60 },
-    { fee: 10000, tickSpacing: 200 },
-    { fee: 100, tickSpacing: 1 },
-  ];
-
-  for (const { fee, tickSpacing } of CONFIGS) {
-    const poolId = ethers.keccak256(
-      coder.encode(
-        ['address', 'address', 'uint24', 'int24', 'address'],
-        [c0, c1, fee, tickSpacing, hooks]
-      )
-    );
-    try {
-      const [sqrtPriceX96] = await pm.getSlot0(poolId);
-      if (sqrtPriceX96 > 0n) {
-        return { currency0: c0, currency1: c1, fee, tickSpacing, hooks };
+  for (const hooks of KNOWN_HOOKS) {
+    for (const { fee, tickSpacing } of PROBE_CONFIGS) {
+      const poolId = ethers.keccak256(
+        coder.encode(
+          ['address', 'address', 'uint24', 'int24', 'address'],
+          [c0, c1, fee, tickSpacing, hooks]
+        )
+      );
+      try {
+        const [sqrtPriceX96] = await pm.getSlot0(poolId);
+        if (sqrtPriceX96 > 0n) {
+          return { currency0: c0, currency1: c1, fee, tickSpacing, hooks };
+        }
+      } catch {
+        return null; // getSlot0 not available on this deployment, skip all probing
       }
-    } catch {
-      break; // getSlot0 not available on this deployment, skip probing
     }
   }
   return null;
 }
 
-async function discoverPoolKey(tokenAddress) {
-  // Fast path: probe common pool configurations via PoolManager.getSlot0
+// onProgress(message) — optional callback for UI feedback
+async function discoverPoolKey(tokenAddress, onProgress) {
+  const notify = onProgress || (() => {});
+
+  // ── Fast path: probe common configs via PoolManager.getSlot0 ──
+  notify('Probing common pool configurations...');
   try {
     const probed = await probeCommonPools(tokenAddress);
     if (probed) return probed;
   } catch {}
 
-  // Slow path: scan Initialize events with precise topic filters
+  // ── Slow path: scan Initialize events on-chain ──
+  notify('Scanning on-chain pool events (this may take a moment)...');
+
   const sig = ethers.id('Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)');
   const block = await provider.getBlockNumber();
 
@@ -106,7 +126,6 @@ async function discoverPoolKey(tokenAddress) {
     ? [tokenAddress, WETH]
     : [WETH, tokenAddress];
 
-  // Filter by indexed currency0 + currency1 for efficiency
   const topic2 = ethers.zeroPadValue(c0, 32);
   const topic3 = ethers.zeroPadValue(c1, 32);
 
@@ -114,30 +133,43 @@ async function discoverPoolKey(tokenAddress) {
     'event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)',
   ]);
 
-  // Search 5M blocks (~115 days on Base) in 10k-block chunks
-  for (let from = block; from >= block - 5000000; from -= 10000) {
-    const fromBlock = Math.max(from - 9999, 0);
-    try {
-      const logs = await provider.getLogs({
-        address:   POOL_MANAGER,
-        topics:    [sig, null, topic2, topic3],
-        fromBlock,
-        toBlock:   from,
-      });
-      for (const log of logs) {
-        try {
-          const e = iface.parseLog(log);
-          return {
-            currency0:   e.args.currency0,
-            currency1:   e.args.currency1,
-            fee:         Number(e.args.fee),
-            tickSpacing: Number(e.args.tickSpacing),
-            hooks:       e.args.hooks,
-          };
-        } catch {}
+  // Search 15M blocks (~350 days on Base @ 2s blocks) in 50k-block chunks
+  const SCAN_RANGE = 15_000_000;
+  const CHUNK      = 50_000;
+  let chunksScanned = 0;
+
+  for (let to = block; to >= block - SCAN_RANGE && to > 0; to -= CHUNK) {
+    const fromBlock = Math.max(to - CHUNK + 1, 0);
+    let retries = 2;
+    while (retries >= 0) {
+      try {
+        const logs = await provider.getLogs({
+          address:   POOL_MANAGER,
+          topics:    [sig, null, topic2, topic3],
+          fromBlock,
+          toBlock:   to,
+        });
+        for (const log of logs) {
+          try {
+            const e = iface.parseLog(log);
+            return {
+              currency0:   e.args.currency0,
+              currency1:   e.args.currency1,
+              fee:         Number(e.args.fee),
+              tickSpacing: Number(e.args.tickSpacing),
+              hooks:       e.args.hooks,
+            };
+          } catch {}
+        }
+        break; // chunk succeeded, move to next
+      } catch {
+        retries--;
+        if (retries >= 0) await new Promise(r => setTimeout(r, 400));
       }
-    } catch {
-      await new Promise(r => setTimeout(r, 200));
+    }
+    chunksScanned++;
+    if (chunksScanned % 20 === 0) {
+      notify(`Still scanning... (${Math.round((chunksScanned * CHUNK / SCAN_RANGE) * 100)}%)`);
     }
   }
   return null;
