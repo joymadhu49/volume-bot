@@ -57,8 +57,11 @@ const ROUTER_ABI = [
 // Known hook contracts on Base — probed alongside standard no-hook pools
 const KNOWN_HOOKS = [
   ethers.ZeroAddress,
-  '0xbB7784A4d481184283Ed89619A3e3ed143e1Adc0', // Clanker hook v1
-  '0x1E4a7e9e0244FbE2e3a5666e6F43E8E1eaEA4D00', // Clanker hook v2
+  '0xbB7784A4d481184283Ed89619A3e3ed143e1Adc0', // Clanker: DecayMulticurveInitializerHook
+  '0x34a45c6B61876d739400Bd71228CbcbD4F53E8cC', // Clanker: ClankerHookDynamicFee
+  '0xd60D6B218116cFd801E28F78d011a203D2b068Cc', // Clanker: ClankerHookDynamicFeeV2
+  '0xDd5EeaFf7BD481AD55Db083062b13a3cdf0A68CC', // Clanker: ClankerHookStaticFee
+  '0xb429d62f8f3bFFb98CdB9569533eA23bF0Ba28CC', // Clanker: ClankerHookStaticFeeV2
 ];
 
 // Common fee / tickSpacing configurations across Uniswap V4 on Base
